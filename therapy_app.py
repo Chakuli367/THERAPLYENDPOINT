@@ -67,7 +67,7 @@ GOOGLE_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 # "en-US-Neural2-F"   — warm, natural female (good balance)
 # "en-US-Neural2-C"   — calm, clear female
 # "en-US-Neural2-D"   — deep, calm male
-GOOGLE_TTS_VOICE = "en-US-Journey-F"
+GOOGLE_TTS_VOICE = "en-US-Neural2-F"  # faster than Journey-F; good quality for therapy
 
 # ── Prompts ───────────────────────────────────────────────────
 THERAPY_SYSTEM_PROMPT = """You are a compassionate CBT-informed therapist running a structured 4-phase mini-session.
@@ -218,10 +218,11 @@ def speak():
                 "audioConfig": {
                     "audioEncoding": "MP3",
                     "speakingRate": 0.92,   # slightly slower = more therapeutic
+                    "pitch": -1.0,          # calmer feel (supported by Neural2)
                     "volumeGainDb": 0.0,
                 }
             },
-            timeout=15
+            timeout=30
         )
 
         if response.status_code != 200:
