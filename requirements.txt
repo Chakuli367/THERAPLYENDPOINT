@@ -4,3 +4,4 @@ openai
 firebase-admin
 python-dotenv
 gunicorn
+google-cloud-texttospeech
