@@ -218,7 +218,6 @@ def speak():
                 "audioConfig": {
                     "audioEncoding": "MP3",
                     "speakingRate": 0.92,   # slightly slower = more therapeutic
-                    "pitch": -1.0,          # slightly lower = calmer feel
                     "volumeGainDb": 0.0,
                 }
             },
