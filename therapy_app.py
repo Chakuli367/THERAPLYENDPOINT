@@ -1,10 +1,9 @@
 import os
 import json
 import io
-import itertools
-import threading
 import requests as http_requests
 import re
+import base64
 from datetime import datetime
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
@@ -56,21 +55,19 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1"
 )
 
-# ── ElevenLabs Key Rotation ──────────────────────────────────
-ELEVENLABS_API_KEYS = [
-    v for k, v in os.environ.items()
-    if k.startswith("ELEVENLABS_API_KEY") and v
-]
-if not ELEVENLABS_API_KEYS:
-    print("⚠️ Warning: No ElevenLabs API keys configured")
+# ── Google Cloud TTS ─────────────────────────────────────────
+GOOGLE_TTS_KEY = os.environ.get("GOOGLE_TTS_KEY")
+if not GOOGLE_TTS_KEY:
+    print("⚠️  Warning: GOOGLE_TTS_KEY not set — /speak will fail")
 
-_key_cycle = itertools.cycle(ELEVENLABS_API_KEYS) if ELEVENLABS_API_KEYS else None
-_key_lock  = threading.Lock()
-ELEVENLABS_VOICE_ID = "cgSgspJ2msm6clMCkdW9"  # Jessica — free tier compatible
+GOOGLE_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 
-def get_next_elevenlabs_key():
-    with _key_lock:
-        return next(_key_cycle)
+# Voice options (uncomment the one you want):
+# "en-US-Journey-F"   — most expressive, closest to ElevenLabs quality
+# "en-US-Neural2-F"   — warm, natural female (good balance)
+# "en-US-Neural2-C"   — calm, clear female
+# "en-US-Neural2-D"   — deep, calm male
+GOOGLE_TTS_VOICE = "en-US-Journey-F"
 
 # ── Prompts ───────────────────────────────────────────────────
 THERAPY_SYSTEM_PROMPT = """You are a compassionate CBT-informed therapist running a structured 4-phase mini-session.
@@ -165,7 +162,6 @@ def transcribe():
         audio_bytes = request.files['audio'].read()
         audio_name  = request.files['audio'].filename or 'audio.webm'
 
-        # Detect format for Android compatibility
         if 'mp4' in audio_name:
             mime = 'audio/mp4'
         elif 'ogg' in audio_name:
@@ -186,7 +182,7 @@ def transcribe():
 
 
 # ════════════════════════════════════════════════════════════
-# ENDPOINT: /speak  (ElevenLabs with key rotation)
+# ENDPOINT: /speak  (Google Cloud TTS)
 # ════════════════════════════════════════════════════════════
 @app.route('/speak', methods=['POST', 'OPTIONS'])
 def speak():
@@ -205,63 +201,49 @@ def speak():
         if not text:
             return jsonify({"error": "No text provided"}), 400
 
-        if not ELEVENLABS_API_KEYS:
-            return jsonify({"error": "No ElevenLabs API keys configured"}), 500
+        if not GOOGLE_TTS_KEY:
+            return jsonify({"error": "GOOGLE_TTS_KEY not configured"}), 500
 
         cleaned_text = clean_text_for_tts(text)
-        last_error   = None
+        print(f"[Google TTS] Synthesizing {len(cleaned_text)} chars with voice {GOOGLE_TTS_VOICE}")
 
-        for _ in range(len(ELEVENLABS_API_KEYS)):
-            api_key = get_next_elevenlabs_key()
-            try:
-                print(f"[ElevenLabs] Trying key ...{api_key[-4:]}")
-                el_response = http_requests.post(
-                    f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
-                    headers={
-                        "xi-api-key": api_key,
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "text": cleaned_text,
-                        "model_id": "eleven_turbo_v2",
-                        "voice_settings": {
-                            "stability": 0.4,
-                            "similarity_boost": 0.75,
-                            "style": 0.3,
-                            "use_speaker_boost": True
-                        }
-                    },
-                    timeout=15
-                )
+        response = http_requests.post(
+            f"{GOOGLE_TTS_URL}?key={GOOGLE_TTS_KEY}",
+            json={
+                "input": {"text": cleaned_text},
+                "voice": {
+                    "languageCode": "en-US",
+                    "name": GOOGLE_TTS_VOICE,
+                },
+                "audioConfig": {
+                    "audioEncoding": "MP3",
+                    "speakingRate": 0.92,   # slightly slower = more therapeutic
+                    "pitch": -1.0,          # slightly lower = calmer feel
+                    "volumeGainDb": 0.0,
+                }
+            },
+            timeout=15
+        )
 
-                if el_response.status_code == 200:
-                    print(f"[ElevenLabs] ✅ Success")
-                    return Response(
-                        el_response.content,
-                        mimetype="audio/mpeg",
-                        headers={
-                            "Content-Type": "audio/mpeg",
-                            "Access-Control-Allow-Origin": "*",
-                        }
-                    )
-                elif el_response.status_code == 429:
-                    print(f"[ElevenLabs] 429 quota hit, rotating...")
-                    last_error = f"429 on key ...{api_key[-4:]}"
-                    continue
-                else:
-                    last_error = f"ElevenLabs {el_response.status_code}: {el_response.text}"
-                    print(f"[ElevenLabs] Error: {last_error}")
-                    # On 402 (paid voice required) or 401, try next key
-                    if el_response.status_code in [401, 402]:
-                        continue
-                    break
+        if response.status_code != 200:
+            print(f"[Google TTS] Error {response.status_code}: {response.text}")
+            return jsonify({"error": f"Google TTS error {response.status_code}: {response.text}"}), 503
 
-            except http_requests.exceptions.Timeout:
-                last_error = "Timeout"
-                print(f"[ElevenLabs] Timeout on key ...{api_key[-4:]}")
-                continue
+        audio_bytes = base64.b64decode(response.json()["audioContent"])
+        print(f"[Google TTS] ✅ Success — {len(audio_bytes)} bytes")
 
-        return jsonify({"error": last_error or "All ElevenLabs keys exhausted"}), 503
+        return Response(
+            audio_bytes,
+            mimetype="audio/mpeg",
+            headers={
+                "Content-Type": "audio/mpeg",
+                "Access-Control-Allow-Origin": "*",
+            }
+        )
+
+    except http_requests.exceptions.Timeout:
+        print("[Google TTS] Request timed out")
+        return jsonify({"error": "Google TTS request timed out"}), 503
 
     except Exception as e:
         import traceback; print(traceback.format_exc())
@@ -501,32 +483,21 @@ def therapy_session_history():
 
 
 # ════════════════════════════════════════════════════════════
-# ENDPOINT: /voices  (debug — list available ElevenLabs voices)
+# ENDPOINT: /health
 # ════════════════════════════════════════════════════════════
-@app.route('/voices', methods=['GET'])
-def list_voices():
-    if not ELEVENLABS_API_KEYS:
-        return jsonify({"error": "No ElevenLabs keys configured"}), 500
-    try:
-        api_key  = ELEVENLABS_API_KEYS[0]
-        response = http_requests.get(
-            "https://api.elevenlabs.io/v1/voices",
-            headers={"xi-api-key": api_key},
-            timeout=10
-        )
-        voices = response.json().get("voices", [])
-        return jsonify([{
-            "name":     v.get("name"),
-            "voice_id": v.get("voice_id"),
-            "category": v.get("category"),
-        } for v in voices])
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status": "ok",
+        "tts_provider": "Google Cloud TTS",
+        "tts_voice": GOOGLE_TTS_VOICE,
+        "tts_key_set": bool(GOOGLE_TTS_KEY),
+    })
 
 
 @app.route('/')
 def index():
-    return jsonify({"status": "Voice therapy backend running ✅"})
+    return jsonify({"status": "Voice therapy backend running ✅", "tts": "Google Cloud TTS"})
 
 
 if __name__ == '__main__':
