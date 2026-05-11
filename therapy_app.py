@@ -1,8 +1,12 @@
 import os
 import json
 import io
+import itertools
+import threading
+import requests as http_requests
+import re
 from datetime import datetime
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from openai import OpenAI
 import firebase_admin
@@ -12,7 +16,27 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
+
+# ── CORS: handle ALL OPTIONS preflights globally ─────────────
+@app.before_request
+def handle_options():
+    if request.method == 'OPTIONS':
+        res = Response()
+        res.headers['Access-Control-Allow-Origin'] = '*'
+        res.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        res.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
+        res.headers['Access-Control-Max-Age'] = '3600'
+        res.status_code = 200
+        return res
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
+    response.headers['Access-Control-Max-Age'] = '3600'
+    return response
 
 # ── Firebase ─────────────────────────────────────────────────
 firebase_config_json = os.environ.get("FIREBASE_CONFIG")
@@ -31,6 +55,22 @@ client = OpenAI(
     api_key=os.environ.get("GROQ_API_KEY"),
     base_url="https://api.groq.com/openai/v1"
 )
+
+# ── ElevenLabs Key Rotation ──────────────────────────────────
+ELEVENLABS_API_KEYS = [
+    v for k, v in os.environ.items()
+    if k.startswith("ELEVENLABS_API_KEY") and v
+]
+if not ELEVENLABS_API_KEYS:
+    print("⚠️ Warning: No ElevenLabs API keys configured")
+
+_key_cycle = itertools.cycle(ELEVENLABS_API_KEYS) if ELEVENLABS_API_KEYS else None
+_key_lock  = threading.Lock()
+ELEVENLABS_VOICE_ID = "cgSgspJ2msm6clMCkdW9"  # Jessica — free tier compatible
+
+def get_next_elevenlabs_key():
+    with _key_lock:
+        return next(_key_cycle)
 
 # ── Prompts ───────────────────────────────────────────────────
 THERAPY_SYSTEM_PROMPT = """You are a compassionate CBT-informed therapist running a structured 4-phase mini-session.
@@ -99,36 +139,132 @@ def parse_json_response(text):
     except Exception:
         return None
 
+def clean_text_for_tts(text: str) -> str:
+    text = re.sub(r'\*\*?(.*?)\*\*?', r'\1', text)
+    text = re.sub(r'^\s*[-•*]\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\[.*?\]|\(.*?\)', '', text)
+    text = re.sub(r'\n{2,}', '. ', text)
+    text = re.sub(r'\n', ' ', text)
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    return text
+
 
 # ════════════════════════════════════════════════════════════
 # ENDPOINT: /transcribe
-# Receives audio blob → returns transcript via Groq Whisper
 # ════════════════════════════════════════════════════════════
 @app.route('/transcribe', methods=['POST', 'OPTIONS'])
 def transcribe():
     if request.method == 'OPTIONS':
         return '', 204
-
     try:
         if 'audio' not in request.files:
             return jsonify({"error": "No audio file provided"}), 400
 
-        audio_file  = request.files['audio']
-        audio_bytes = audio_file.read()
+        audio_bytes = request.files['audio'].read()
+        audio_name  = request.files['audio'].filename or 'audio.webm'
+
+        # Detect format for Android compatibility
+        if 'mp4' in audio_name:
+            mime = 'audio/mp4'
+        elif 'ogg' in audio_name:
+            mime = 'audio/ogg'
+        else:
+            mime = 'audio/webm'
 
         transcript = client.audio.transcriptions.create(
             model="whisper-large-v3-turbo",
-            file=("audio.webm", io.BytesIO(audio_bytes), "audio/webm"),
+            file=(audio_name, io.BytesIO(audio_bytes), mime),
         )
 
-        return jsonify({
-            "success":    True,
-            "transcript": transcript.text.strip()
-        })
+        return jsonify({"success": True, "transcript": transcript.text.strip()})
 
     except Exception as e:
-        import traceback
-        print(traceback.format_exc())
+        import traceback; print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINT: /speak  (ElevenLabs with key rotation)
+# ════════════════════════════════════════════════════════════
+@app.route('/speak', methods=['POST', 'OPTIONS'])
+def speak():
+    if request.method == 'OPTIONS':
+        res = Response()
+        res.headers['Access-Control-Allow-Origin'] = '*'
+        res.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        res.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        res.headers['Access-Control-Max-Age'] = '3600'
+        res.status_code = 200
+        return res
+
+    try:
+        data = request.get_json()
+        text = data.get("text", "").strip()
+        if not text:
+            return jsonify({"error": "No text provided"}), 400
+
+        if not ELEVENLABS_API_KEYS:
+            return jsonify({"error": "No ElevenLabs API keys configured"}), 500
+
+        cleaned_text = clean_text_for_tts(text)
+        last_error   = None
+
+        for _ in range(len(ELEVENLABS_API_KEYS)):
+            api_key = get_next_elevenlabs_key()
+            try:
+                print(f"[ElevenLabs] Trying key ...{api_key[-4:]}")
+                el_response = http_requests.post(
+                    f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
+                    headers={
+                        "xi-api-key": api_key,
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "text": cleaned_text,
+                        "model_id": "eleven_turbo_v2",
+                        "voice_settings": {
+                            "stability": 0.4,
+                            "similarity_boost": 0.75,
+                            "style": 0.3,
+                            "use_speaker_boost": True
+                        }
+                    },
+                    timeout=15
+                )
+
+                if el_response.status_code == 200:
+                    print(f"[ElevenLabs] ✅ Success")
+                    return Response(
+                        el_response.content,
+                        mimetype="audio/mpeg",
+                        headers={
+                            "Content-Type": "audio/mpeg",
+                            "Access-Control-Allow-Origin": "*",
+                        }
+                    )
+                elif el_response.status_code == 429:
+                    print(f"[ElevenLabs] 429 quota hit, rotating...")
+                    last_error = f"429 on key ...{api_key[-4:]}"
+                    continue
+                else:
+                    last_error = f"ElevenLabs {el_response.status_code}: {el_response.text}"
+                    print(f"[ElevenLabs] Error: {last_error}")
+                    # On 402 (paid voice required) or 401, try next key
+                    if el_response.status_code in [401, 402]:
+                        continue
+                    break
+
+            except http_requests.exceptions.Timeout:
+                last_error = "Timeout"
+                print(f"[ElevenLabs] Timeout on key ...{api_key[-4:]}")
+                continue
+
+        return jsonify({"error": last_error or "All ElevenLabs keys exhausted"}), 503
+
+    except Exception as e:
+        import traceback; print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 
@@ -139,7 +275,6 @@ def transcribe():
 def therapy_session():
     if request.method == 'OPTIONS':
         return '', 204
-
     try:
         data         = request.get_json()
         user_id      = data.get("user_id")
@@ -254,8 +389,7 @@ def therapy_session():
         })
 
     except Exception as e:
-        import traceback
-        print(traceback.format_exc())
+        import traceback; print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 
@@ -266,7 +400,6 @@ def therapy_session():
 def session_to_plan():
     if request.method == 'OPTIONS':
         return '', 204
-
     try:
         data       = request.get_json()
         user_id    = data.get("user_id")
@@ -323,8 +456,7 @@ def session_to_plan():
         return jsonify({"success": True, "plan": plan, "activity_id": ref.id})
 
     except Exception as e:
-        import traceback
-        print(traceback.format_exc())
+        import traceback; print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
 
@@ -364,6 +496,30 @@ def therapy_session_history():
 
         return jsonify({"success": True, "sessions": sessions})
 
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINT: /voices  (debug — list available ElevenLabs voices)
+# ════════════════════════════════════════════════════════════
+@app.route('/voices', methods=['GET'])
+def list_voices():
+    if not ELEVENLABS_API_KEYS:
+        return jsonify({"error": "No ElevenLabs keys configured"}), 500
+    try:
+        api_key  = ELEVENLABS_API_KEYS[0]
+        response = http_requests.get(
+            "https://api.elevenlabs.io/v1/voices",
+            headers={"xi-api-key": api_key},
+            timeout=10
+        )
+        voices = response.json().get("voices", [])
+        return jsonify([{
+            "name":     v.get("name"),
+            "voice_id": v.get("voice_id"),
+            "category": v.get("category"),
+        } for v in voices])
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
