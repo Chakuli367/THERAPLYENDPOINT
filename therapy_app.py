@@ -8,6 +8,8 @@ import base64
 from datetime import datetime
 import subprocess
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from openai import OpenAI
@@ -65,7 +67,6 @@ def bootstrap_tts_config(max_retries=5, delay=2):
         "emotion_aware":      True,
         "effects_profile":    "headphone-class-device",
     }
-    import time
     ref = db.collection("config").document("tts_settings")
     for attempt in range(1, max_retries + 1):
         try:
@@ -111,6 +112,11 @@ TTS_DEFAULTS = {
     "emotion_aware":      True,
     "effects_profile":    "headphone-class-device",
 }
+
+# ── TTS config cache — stops hitting Firestore on every request ──
+_tts_config_cache = None
+_tts_config_cache_time = 0
+TTS_CONFIG_CACHE_TTL = 60  # seconds — refresh every 60s not every request
 
 # ── All available Chirp HD voices for the test page ──────────
 AVAILABLE_VOICES = [
@@ -234,12 +240,21 @@ def merge_mp3s(chunks):
         return b"".join(chunks)
 
 
+# ── FIX 1: Cached Firestore config — only hits Firebase every 60s ──
 def get_tts_config():
+    global _tts_config_cache, _tts_config_cache_time
+
+    now = time.time()
+    if _tts_config_cache is not None and (now - _tts_config_cache_time) < TTS_CONFIG_CACHE_TTL:
+        return _tts_config_cache
+
     try:
         doc = db.collection("config").document("tts_settings").get()
         data = doc.to_dict() if doc.exists else {}
     except Exception as e:
-        print(f"[TTS config] Firestore read failed, using defaults: {e}")
+        print(f"[TTS config] Firestore read failed, using cache or defaults: {e}")
+        if _tts_config_cache is not None:
+            return _tts_config_cache
         data = {}
 
     cfg = {**TTS_DEFAULTS, **{k: v for k, v in data.items() if k in TTS_DEFAULTS}}
@@ -247,6 +262,10 @@ def get_tts_config():
     cfg["pitch"]              = max(-20.0, min(20.0, float(cfg["pitch"])))
     cfg["volume_gain_db"]     = max(-96.0, min(16.0, float(cfg["volume_gain_db"])))
     cfg["filler_probability"] = max(0.0,  min(1.0,  float(cfg["filler_probability"])))
+
+    _tts_config_cache = cfg
+    _tts_config_cache_time = now
+    print(f"[TTS config] Cache refreshed — voice: {cfg['voice']}")
     return cfg
 
 
@@ -488,6 +507,36 @@ def synthesize_sentence(sentence, cfg=None):
         return None
 
 
+# ── FIX 2: Parallel TTS synthesis — all sentences at once ────
+def synthesize_sentences_parallel(sentences, cfg):
+    """
+    Fire all TTS requests simultaneously instead of one by one.
+    Returns chunks in the correct order even though they arrive out of order.
+    Max 8 workers — enough for any therapy response without overwhelming Google TTS.
+    """
+    results = [None] * len(sentences)
+    max_workers = min(8, len(sentences))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_index = {
+            executor.submit(synthesize_sentence, sentence, cfg): i
+            for i, sentence in enumerate(sentences)
+            if sentence.strip()
+        }
+        for future in as_completed(future_to_index):
+            idx = future_to_index[future]
+            try:
+                results[idx] = future.result()
+            except Exception as e:
+                print(f"[parallel TTS] sentence {idx} failed: {e}")
+                results[idx] = None
+
+    # Filter out None results but keep order
+    chunks = [r for r in results if r is not None]
+    print(f"[parallel TTS] {len(chunks)}/{len(sentences)} sentences synthesized successfully")
+    return chunks
+
+
 # ════════════════════════════════════════════════════════════
 # ENDPOINT: /transcribe
 # ════════════════════════════════════════════════════════════
@@ -522,6 +571,7 @@ def transcribe():
 
 # ════════════════════════════════════════════════════════════
 # ENDPOINT: /speak (single-shot TTS)
+# FIX: now uses parallel synthesis + cached config
 # ════════════════════════════════════════════════════════════
 @app.route('/speak', methods=['POST', 'OPTIONS'])
 def speak():
@@ -543,29 +593,28 @@ def speak():
             return jsonify({"error": "GOOGLE_TTS_KEY not configured"}), 500
 
         clean = clean_text_for_tts(text)
-        cfg = get_tts_config()
+        cfg = get_tts_config()  # cached — no Firestore hit if within 60s
         filled = add_thinking_filler(clean, cfg)
         final = emotion_aware_preprocess(filled, cfg)
 
-        print(f"[Google TTS] Voice: {cfg['voice']} | Text: {final[:120]}")
+        # Split into sentences and synthesize in parallel
+        sentences = split_into_sentences(final) or [final]
+        print(f"[/speak] {len(sentences)} sentence(s) | voice: {cfg['voice']}")
 
-        response = http_requests.post(
-            f"{GOOGLE_TTS_URL}?key={GOOGLE_TTS_KEY}",
-            json={
-                "input": {"text": final},
-                "voice": {"languageCode": "en-US", "name": cfg["voice"]},
-                "audioConfig": build_audio_config(cfg),
-            },
-            timeout=30
-        )
+        if len(sentences) == 1:
+            # Single sentence — direct call, no parallel overhead
+            audio_bytes = synthesize_sentence(sentences[0], cfg)
+            if not audio_bytes:
+                return jsonify({"error": "TTS produced no audio"}), 500
+        else:
+            # Multiple sentences — fire all at once
+            chunks = synthesize_sentences_parallel(sentences, cfg)
+            if not chunks:
+                return jsonify({"error": "TTS produced no audio"}), 500
+            audio_bytes = merge_mp3s(chunks)
 
-        if response.status_code != 200:
-            print(f"[Google TTS] Error {response.status_code}: {response.text}")
-            return jsonify({"error": f"Google TTS error {response.status_code}: {response.text}"}), 503
-
-        audio_bytes = base64.b64decode(response.json()["audioContent"])
         padded_audio = append_silence(audio_bytes)
-        print(f"[Google TTS] OK — padded to {len(padded_audio)} bytes total")
+        print(f"[/speak] done — {len(padded_audio)} bytes total")
 
         return Response(
             padded_audio,
@@ -582,6 +631,8 @@ def speak():
 
 # ════════════════════════════════════════════════════════════
 # ENDPOINT: /speak-stream
+# FIX: parallel synthesis + stream chunks directly without
+#      holding everything in RAM first
 # ════════════════════════════════════════════════════════════
 @app.route('/speak-stream', methods=['POST', 'OPTIONS'])
 def speak_stream():
@@ -610,26 +661,24 @@ def speak_stream():
             pass
 
         clean = clean_sentence_for_tts(text)
-        cfg = get_tts_config()
+        cfg = get_tts_config()  # cached — no Firestore hit if within 60s
         filled = add_thinking_filler(clean, cfg)
         final = emotion_aware_preprocess(filled, cfg)
         sentences = split_into_sentences(final) or [final]
 
         print(f"[speak-stream] {len(sentences)} sentence(s) → voice: {cfg['voice']}")
 
-        def generate():
-            chunks = []
-            for i, sentence in enumerate(sentences):
-                if not sentence.strip():
-                    continue
-                chunk = synthesize_sentence(sentence, cfg)
-                if chunk:
-                    print(f"[speak-stream] chunk {i+1}/{len(sentences)}: {len(chunk)} bytes")
-                    chunks.append(chunk)
+        # Synthesize all sentences in parallel upfront
+        # This is faster than sequential AND we can still stream
+        chunks = synthesize_sentences_parallel(sentences, cfg)
 
+        def generate():
             if not chunks:
                 return
 
+            # Merge and add silence tail, then stream the result
+            # We still need to hold the final merged audio briefly
+            # but it's one ffmpeg call instead of N sequential TTS calls
             if len(chunks) == 1:
                 combined_bytes = chunks[0]
             else:
@@ -637,7 +686,11 @@ def speak_stream():
 
             final_bytes = append_silence(combined_bytes)
             print(f"[speak-stream] streaming {len(final_bytes)} bytes total (incl. 3s silence)")
-            yield final_bytes
+
+            # Stream in 64KB chunks so we're not blocking the socket
+            chunk_size = 65536
+            for i in range(0, len(final_bytes), chunk_size):
+                yield final_bytes[i:i + chunk_size]
 
         return Response(
             stream_with_context(generate()),
@@ -655,7 +708,7 @@ def speak_stream():
 
 
 # ════════════════════════════════════════════════════════════
-# ENDPOINT: /speak-test  — raw voice tester, no fillers/processing
+# ENDPOINT: /speak-test  — RAW VOICE TESTER — NOT TOUCHED
 # ════════════════════════════════════════════════════════════
 @app.route('/speak-test', methods=['POST', 'OPTIONS'])
 def speak_test():
@@ -1138,16 +1191,16 @@ def therapy_session():
 
         if not session_id or start_new:
             session_id = f"therapy_{user_id}_{int(datetime.now().timestamp())}"
-            session_data = {{
+            session_data = {
                 "session_id": session_id, "user_id": user_id,
                 "messages": [], "phase": 1,
-                "extracted": {{
+                "extracted": {
                     "situation": "", "anxious_thought": "", "emotion": "", "reframe": "",
-                    "proposed_task": {{"name": "", "type": "", "why": "", "anxiety_pre": 5, "action_steps": []}}
-                }},
+                    "proposed_task": {"name": "", "type": "", "why": "", "anxiety_pre": 5, "action_steps": []}
+                },
                 "session_complete": False,
                 "created_at": datetime.utcnow().isoformat()
-            }}
+            }
             db.collection("users").document(user_id) \
               .collection("therapy_sessions").document(session_id).set(session_data)
         else:
@@ -1158,22 +1211,22 @@ def therapy_session():
             session_data = doc.to_dict()
 
         if session_data.get("session_complete"):
-            return jsonify({{
+            return jsonify({
                 "session_id": session_id, "reply": "This session is complete.",
                 "phase": 5, "session_complete": True,
-                "extracted": session_data.get("extracted", {{}})
-            }})
+                "extracted": session_data.get("extracted", {})
+            })
 
         messages = session_data.get("messages", [])
         if len(messages) == 0:
-            messages = [{{"role": "system", "content": THERAPY_SYSTEM_PROMPT}}]
+            messages = [{"role": "system", "content": THERAPY_SYSTEM_PROMPT}]
 
-        messages.append({{"role": "user", "content": user_message}})
+        messages.append({"role": "user", "content": user_message})
 
         current_phase = session_data.get("phase", 1)
-        extracted_so_far = session_data.get("extracted", {{}})
+        extracted_so_far = session_data.get("extracted", {})
 
-        length_guide = {{
+        length_guide = {
             "short": "RESPONSE LENGTH: SHORT — 1 to 2 sentences max. One thought only.",
             "medium": "RESPONSE LENGTH: MEDIUM — 2 to 3 sentences. One main point plus a follow-up question.",
             "long": (
@@ -1183,20 +1236,20 @@ def therapy_session():
                 "Use natural pauses (...) between thoughts. Do NOT rush to the question — earn it by "
                 "showing you've really heard them first. The person should feel truly seen."
             ),
-        }}.get(response_length, "RESPONSE LENGTH: LONG — 5 to 7 sentences.")
+        }.get(response_length, "RESPONSE LENGTH: LONG — 5 to 7 sentences.")
 
-        length_tokens = {{"short": 200, "medium": 400, "long": 1200}}.get(response_length, 1200)
+        length_tokens = {"short": 200, "medium": 400, "long": 1200}.get(response_length, 1200)
 
-        phase_reminder = {{
+        phase_reminder = {
             "role": "system",
             "content": (
-                f"CURRENT PHASE: {{current_phase}}\n"
-                f"EXTRACTED SO FAR: {{json.dumps(extracted_so_far)}}\n"
-                f"{{length_guide}}\n"
+                f"CURRENT PHASE: {current_phase}\n"
+                f"EXTRACTED SO FAR: {json.dumps(extracted_so_far)}\n"
+                f"{length_guide}\n"
                 "Respond with valid JSON only. Write the message for the EAR — warm, unhurried, "
                 "conversational. Use short sentences and natural pauses (...)."
             )
-        }}
+        }
         messages_for_model = [messages[0], phase_reminder] + messages[1:]
 
         response = client.chat.completions.create(
@@ -1209,25 +1262,25 @@ def therapy_session():
         parsed = parse_json_response(raw_reply)
 
         if not parsed:
-            messages.append({{"role": "assistant", "content": raw_reply}})
+            messages.append({"role": "assistant", "content": raw_reply})
             db.collection("users").document(user_id) \
               .collection("therapy_sessions").document(session_id) \
-              .update({{"messages": messages}})
-            return jsonify({{
+              .update({"messages": messages})
+            return jsonify({
                 "session_id": session_id, "reply": raw_reply,
                 "phase": current_phase, "session_complete": False
-            }})
+            })
 
         ai_reply = parsed.get("message", raw_reply)
         next_phase = parsed.get("phase", current_phase)
         session_complete = parsed.get("session_complete", False)
-        new_extracted = parsed.get("extracted", {{}})
+        new_extracted = parsed.get("extracted", {})
 
-        merged = session_data.get("extracted", {{}})
+        merged = session_data.get("extracted", {})
         for key, val in new_extracted.items():
             if isinstance(val, dict):
                 if key not in merged:
-                    merged[key] = {{}}
+                    merged[key] = {}
                 for subkey, subval in val.items():
                     if subval and subval != "" and subval != 0:
                         merged[key][subkey] = subval
@@ -1235,13 +1288,13 @@ def therapy_session():
                 if val and val != "" and val != 0:
                     merged[key] = val
 
-        messages.append({{"role": "assistant", "content": ai_reply}})
+        messages.append({"role": "assistant", "content": ai_reply})
 
-        update_payload = {{
+        update_payload = {
             "messages": messages, "phase": next_phase,
             "extracted": merged, "session_complete": session_complete,
             "updated_at": datetime.utcnow().isoformat()
-        }}
+        }
         if session_complete:
             update_payload["completed_at"] = datetime.utcnow().isoformat()
 
@@ -1249,9 +1302,9 @@ def therapy_session():
           .collection("therapy_sessions").document(session_id).update(update_payload)
 
         tone, pause_ms = detect_reply_tone(ai_reply)
-        print(f"[tone] → {{tone}} | pause {{pause_ms}}ms before speaking")
+        print(f"[tone] → {tone} | pause {pause_ms}ms before speaking")
 
-        return jsonify({{
+        return jsonify({
             "session_id": session_id, "reply": ai_reply,
             "phase": next_phase, "session_complete": session_complete,
             "extracted": merged,
@@ -1259,11 +1312,11 @@ def therapy_session():
             "tone": tone,
             "pause_ms": pause_ms,
             "response_length": response_length,
-        }})
+        })
 
     except Exception as e:
         import traceback; print(traceback.format_exc())
-        return jsonify({{"error": str(e)}}), 500
+        return jsonify({"error": str(e)}), 500
 
 
 # ════════════════════════════════════════════════════════════
@@ -1387,6 +1440,8 @@ def health():
         "chirp_hd_mode": "Chirp-HD" in cfg["voice"],
         "live_config": cfg,
         "features": [
+            "parallel sentence synthesis via ThreadPoolExecutor (max 8 workers)",
+            "TTS config cached 60s — no Firestore hit on every request",
             "sentence-chunked streaming via /speak-stream",
             f"thinking fillers — {'enabled' if cfg['filler_enabled'] else 'disabled'} @ {int(cfg['filler_probability']*100)}%",
             f"emotion-aware pacing — {'enabled' if cfg['emotion_aware'] else 'disabled'}",
@@ -1416,8 +1471,11 @@ def tts_config():
         updates = request.get_json() or {}
 
         if updates.get("action") == "reset_defaults":
+            global _tts_config_cache, _tts_config_cache_time
             db.collection("config").document("tts_settings").delete()
             bootstrap_tts_config()
+            _tts_config_cache = None  # bust the cache
+            _tts_config_cache_time = 0
             cfg = get_tts_config()
             return jsonify({"success": True, "action": "reset_defaults", "current_config": cfg})
 
@@ -1427,6 +1485,11 @@ def tts_config():
             return jsonify({"error": f"No valid fields. Allowed: {sorted(allowed)}"}), 400
 
         db.collection("config").document("tts_settings").set(filtered, merge=True)
+
+        # Bust the cache so the update is picked up immediately
+        _tts_config_cache = None
+        _tts_config_cache_time = 0
+
         cfg = get_tts_config()
         print(f"[tts-config] Updated: {filtered}")
         return jsonify({"success": True, "updated": filtered, "current_config": cfg})
@@ -1442,8 +1505,8 @@ def index():
         "status": "Voice therapy backend running",
         "tts": "Google Cloud TTS — Chirp HD-O (plain text)",
         "endpoints": {
-            "/speak": "single-shot TTS (+ 3s silence tail)",
-            "/speak-stream": "sentence-chunked TTS (+ 3s silence tail)",
+            "/speak": "single-shot TTS (parallel synthesis + 3s silence tail)",
+            "/speak-stream": "sentence-chunked TTS (parallel synthesis + 3s silence tail)",
             "/speak-test": "raw voice tester — no fillers, voice override supported",
             "/voice-test-ui": "browser UI for voice testing",
             "/voices": "list all available voices",
