@@ -593,6 +593,7 @@ def therapy_session():
         user_message = data.get("message", "").strip()
         session_id = data.get("session_id")
         start_new = data.get("start_new", False)
+        response_length = data.get("response_length", "medium")  # "short" | "medium" | "long"
 
         if not user_id or not user_message:
             return jsonify({"error": "user_id and message required"}), 400
@@ -634,12 +635,32 @@ def therapy_session():
         current_phase = session_data.get("phase", 1)
         extracted_so_far = session_data.get("extracted", {})
 
+        length_guide = {
+            "short": (
+                "RESPONSE LENGTH: SHORT — 1 to 2 sentences max. One thought only. "
+                "Get straight to the point. No elaboration."
+            ),
+            "medium": (
+                "RESPONSE LENGTH: MEDIUM — 2 to 3 sentences. One main point plus a follow-up question. "
+                "Warm but concise."
+            ),
+            "long": (
+                "RESPONSE LENGTH: LONG — 4 to 6 sentences. This is what a real therapist sounds like. "
+                "Validate first, then reflect, then gently explore or reframe, then close with a question. "
+                "Take your time. Let the reply breathe. Use natural pauses (...) between thoughts. "
+                "Do NOT rush to the question — earn it by showing you've really heard them first."
+            ),
+        }.get(response_length, "RESPONSE LENGTH: MEDIUM — 2 to 3 sentences.")
+
+        length_tokens = {"short": 200, "medium": 400, "long": 800}.get(response_length, 400)
+
         phase_reminder = {
             "role": "system",
             "content": (
                 f"CURRENT PHASE: {current_phase}\n"
                 f"EXTRACTED SO FAR: {json.dumps(extracted_so_far)}\n"
-                "Respond with valid JSON only. Write the message for the EAR — short, warm, max 12 words per sentence."
+                f"{length_guide}\n"
+                "Respond with valid JSON only. Write the message for the EAR — warm, conversational, max 12 words per sentence."
             )
         }
         messages_for_model = [messages[0], phase_reminder] + messages[1:]
@@ -648,7 +669,7 @@ def therapy_session():
             model="llama-3.3-70b-versatile",
             messages=messages_for_model,
             temperature=0.65,
-            max_tokens=600
+            max_tokens=length_tokens
         )
         raw_reply = response.choices[0].message.content.strip()
         parsed = parse_json_response(raw_reply)
@@ -703,6 +724,7 @@ def therapy_session():
             "turn_count": len([m for m in messages if m["role"] == "user"]),
             "tone": tone,
             "pause_ms": pause_ms,
+            "response_length": response_length,
         })
 
     except Exception as e:
