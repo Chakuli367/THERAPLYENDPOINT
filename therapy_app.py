@@ -50,6 +50,48 @@ if not firebase_admin._apps:
 
 db = firestore.client()
 
+
+# ── Bootstrap: create config/tts_settings if it doesn't exist ──
+def bootstrap_tts_config(max_retries=5, delay=2):
+    """
+    Creates the config/tts_settings Firestore document on first deploy.
+    Uses set(..., merge=True) so it never overwrites values you've already tuned.
+    Retries up to max_retries times with a delay between attempts.
+    Safe to call on every startup — skips if all fields already exist.
+    """
+    defaults = {
+        "voice":              "en-US-Chirp-HD-O",
+        "speaking_rate":      1.0,
+        "pitch":              0.0,
+        "volume_gain_db":     0.0,
+        "filler_enabled":     True,
+        "filler_probability": 0.4,
+        "emotion_aware":      True,
+        "effects_profile":    "headphone-class-device",
+    }
+    import time
+    ref = db.collection("config").document("tts_settings")
+    for attempt in range(1, max_retries + 1):
+        try:
+            doc = ref.get()
+            existing = doc.to_dict() if doc.exists else {}
+            # Only write fields that are genuinely missing
+            missing = {k: v for k, v in defaults.items() if k not in existing}
+            if missing:
+                ref.set(missing, merge=True)
+                print(f"[bootstrap] config/tts_settings created/patched: {list(missing.keys())}")
+            else:
+                print("[bootstrap] config/tts_settings already complete — no changes needed")
+            return  # success
+        except Exception as e:
+            print(f"[bootstrap] Attempt {attempt}/{max_retries} failed: {e}")
+            if attempt < max_retries:
+                time.sleep(delay)
+    print("[bootstrap] WARNING: could not initialise config/tts_settings — defaults will be used at runtime")
+
+bootstrap_tts_config()
+
+
 # ── Groq client ──────────────────────────────────────────────
 client = OpenAI(
     api_key=os.environ.get("GROQ_API_KEY"),
@@ -769,6 +811,14 @@ def tts_config():
     # POST — update one or more fields
     try:
         updates = request.get_json() or {}
+
+        # Special action: retry bootstrap
+        if updates.get("action") == "reset_defaults":
+            db.collection("config").document("tts_settings").delete()
+            bootstrap_tts_config()
+            cfg = get_tts_config()
+            return jsonify({"success": True, "action": "reset_defaults", "current_config": cfg})
+
         allowed = set(TTS_DEFAULTS.keys())
         filtered = {k: v for k, v in updates.items() if k in allowed}
         if not filtered:
