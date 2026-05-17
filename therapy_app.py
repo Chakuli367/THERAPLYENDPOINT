@@ -63,10 +63,64 @@ if not GOOGLE_TTS_KEY:
 
 GOOGLE_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 
-# Chirp HD — most human Google voice on free plan.
-# Does NOT support SSML, speakingRate, or pitch — prosody comes from text alone.
-# -O = calm, grounded — best for therapy tone
-GOOGLE_TTS_VOICE = "en-US-Chirp-HD-O"
+# ── TTS config defaults (used if Firestore doc is missing or a field is absent) ──
+TTS_DEFAULTS = {
+    "voice":              "en-US-Chirp-HD-O",
+    "speaking_rate":      1.0,       # 0.25–4.0  (ignored for Chirp HD voices)
+    "pitch":              0.0,       # -20–20.0  (ignored for Chirp HD voices)
+    "volume_gain_db":     0.0,       # -96–16.0  (works on all voices)
+    "filler_enabled":     True,
+    "filler_probability": 0.4,       # 0.0–1.0
+    "emotion_aware":      True,
+    "effects_profile":    "headphone-class-device",
+}
+
+
+def get_tts_config():
+    """
+    Read TTS settings from Firestore config/tts_settings on every call.
+    Falls back to TTS_DEFAULTS for any missing field.
+    Chirp HD voices don't support speakingRate or pitch — those keys are
+    silently dropped when the voice name contains 'Chirp-HD'.
+    """
+    try:
+        doc = db.collection("config").document("tts_settings").get()
+        data = doc.to_dict() if doc.exists else {}
+    except Exception as e:
+        print(f"[TTS config] Firestore read failed, using defaults: {e}")
+        data = {}
+
+    cfg = {**TTS_DEFAULTS, **{k: v for k, v in data.items() if k in TTS_DEFAULTS}}
+
+    # Validate ranges
+    cfg["speaking_rate"]      = max(0.25, min(4.0,  float(cfg["speaking_rate"])))
+    cfg["pitch"]              = max(-20.0, min(20.0, float(cfg["pitch"])))
+    cfg["volume_gain_db"]     = max(-96.0, min(16.0, float(cfg["volume_gain_db"])))
+    cfg["filler_probability"] = max(0.0,  min(1.0,  float(cfg["filler_probability"])))
+
+    return cfg
+
+
+def build_audio_config(cfg):
+    """
+    Build the audioConfig dict for the Google TTS API call.
+    Chirp HD voices silently ignore speakingRate and pitch but don't error —
+    however some HD variants DO error, so we strip them to be safe.
+    """
+    audio_cfg = {
+        "audioEncoding": "MP3",
+        "volumeGainDb":  cfg["volume_gain_db"],
+    }
+    if cfg["effects_profile"]:
+        audio_cfg["effectsProfileId"] = [cfg["effects_profile"]]
+
+    is_chirp_hd = "Chirp-HD" in cfg["voice"] or "Chirp3-HD" in cfg["voice"]
+    if not is_chirp_hd:
+        audio_cfg["speakingRate"] = cfg["speaking_rate"]
+        audio_cfg["pitch"]        = cfg["pitch"]
+
+    return audio_cfg
+
 
 # ── Thinking fillers ──────────────────────────────────────────
 THINKING_FILLERS = [
@@ -221,26 +275,35 @@ def clean_text_for_tts(text):
     return clean_sentence_for_tts(text)
 
 
-def add_thinking_filler(text):
+def add_thinking_filler(text, cfg=None):
     """
-    Randomly prepend a warm thinking filler 40% of the time.
+    Randomly prepend a warm thinking filler.
+    Probability and enabled flag come from Firebase config.
     Skips if text already starts with a natural opener.
     """
+    if cfg is None:
+        cfg = TTS_DEFAULTS
+    if not cfg.get("filler_enabled", True):
+        return text
     filler_starts = ('mmm', 'yeah', 'right', 'okay', 'got it', 'so ', 'and ')
     if text.lower().startswith(filler_starts):
         return text
-    if random.random() < 0.40:
+    if random.random() < cfg.get("filler_probability", 0.4):
         filler = random.choice(THINKING_FILLERS)
         return f"{filler} {text}"
     return text
 
 
-def emotion_aware_preprocess(text):
+def emotion_aware_preprocess(text, cfg=None):
     """
     Detect emotional weight and adjust pacing.
-    Heavy statements get a natural pause inserted after the first sentence.
-    Pure text logic — no extra API calls.
+    Controlled by emotion_aware flag in Firebase config.
     """
+    if cfg is None:
+        cfg = TTS_DEFAULTS
+    if not cfg.get("emotion_aware", True):
+        return text
+
     heavy_keywords = [
         'scared', 'terrified', 'alone', 'hopeless', 'worthless',
         'failure', 'hate myself', 'awful', 'devastated', 'breakdown',
@@ -257,8 +320,10 @@ def emotion_aware_preprocess(text):
     return text
 
 
-def synthesize_sentence(sentence):
-    """Call Google TTS for a single sentence. Returns MP3 bytes or None."""
+def synthesize_sentence(sentence, cfg=None):
+    """Call Google TTS for a single sentence using live Firebase config. Returns MP3 bytes or None."""
+    if cfg is None:
+        cfg = TTS_DEFAULTS
     if not GOOGLE_TTS_KEY:
         return None
     try:
@@ -266,11 +331,8 @@ def synthesize_sentence(sentence):
             f"{GOOGLE_TTS_URL}?key={GOOGLE_TTS_KEY}",
             json={
                 "input": {"text": sentence},
-                "voice": {"languageCode": "en-US", "name": GOOGLE_TTS_VOICE},
-                "audioConfig": {
-                    "audioEncoding": "MP3",
-                    "effectsProfileId": ["headphone-class-device"],
-                }
+                "voice": {"languageCode": "en-US", "name": cfg["voice"]},
+                "audioConfig": build_audio_config(cfg),
             },
             timeout=15
         )
@@ -338,20 +400,18 @@ def speak():
             return jsonify({"error": "GOOGLE_TTS_KEY not configured"}), 500
 
         clean = clean_text_for_tts(text)
-        filled = add_thinking_filler(clean)
-        final = emotion_aware_preprocess(filled)
+        cfg = get_tts_config()
+        filled = add_thinking_filler(clean, cfg)
+        final = emotion_aware_preprocess(filled, cfg)
 
-        print(f"[Google TTS] Voice: {GOOGLE_TTS_VOICE} | Text: {final[:120]}")
+        print(f"[Google TTS] Voice: {cfg['voice']} | Chirp-HD: {'Chirp-HD' in cfg['voice']} | Text: {final[:120]}")
 
         response = http_requests.post(
             f"{GOOGLE_TTS_URL}?key={GOOGLE_TTS_KEY}",
             json={
                 "input": {"text": final},
-                "voice": {"languageCode": "en-US", "name": GOOGLE_TTS_VOICE},
-                "audioConfig": {
-                    "audioEncoding": "MP3",
-                    "effectsProfileId": ["headphone-class-device"],
-                }
+                "voice": {"languageCode": "en-US", "name": cfg["voice"]},
+                "audioConfig": build_audio_config(cfg),
             },
             timeout=30
         )
@@ -407,17 +467,18 @@ def speak_stream():
             pass
 
         clean = clean_sentence_for_tts(text)
-        filled = add_thinking_filler(clean)
-        final = emotion_aware_preprocess(filled)
+        cfg = get_tts_config()
+        filled = add_thinking_filler(clean, cfg)
+        final = emotion_aware_preprocess(filled, cfg)
         sentences = split_into_sentences(final) or [final]
 
-        print(f"[speak-stream] {len(sentences)} sentence(s) → Chirp HD")
+        print(f"[speak-stream] {len(sentences)} sentence(s) → voice: {cfg['voice']}")
 
         def generate():
             for i, sentence in enumerate(sentences):
                 if not sentence.strip():
                     continue
-                chunk = synthesize_sentence(sentence)
+                chunk = synthesize_sentence(sentence, cfg)
                 if chunk:
                     print(f"[speak-stream] chunk {i+1}/{len(sentences)}: {len(chunk)} bytes")
                     yield chunk
@@ -674,20 +735,53 @@ def therapy_session_history():
 # ════════════════════════════════════════════════════════════
 @app.route('/health', methods=['GET'])
 def health():
+    cfg = get_tts_config()
     return jsonify({
         "status": "ok",
-        "tts_provider": "Google Cloud TTS — Chirp HD",
-        "tts_voice": GOOGLE_TTS_VOICE,
+        "tts_provider": "Google Cloud TTS",
+        "tts_voice": cfg["voice"],
         "tts_key_set": bool(GOOGLE_TTS_KEY),
-        "ssml_enabled": False,
+        "chirp_hd_mode": "Chirp-HD" in cfg["voice"],
+        "live_config": cfg,
         "features": [
             "sentence-chunked streaming via /speak-stream",
-            "thinking fillers — 40% random prepend",
-            "emotion-aware pacing",
+            f"thinking fillers — {'enabled' if cfg['filler_enabled'] else 'disabled'} @ {int(cfg['filler_probability']*100)}%",
+            f"emotion-aware pacing — {'enabled' if cfg['emotion_aware'] else 'disabled'}",
             "JSON safety net in /speak and /speak-stream",
             "digit-to-word conversion",
+            "Firebase-driven TTS config via config/tts_settings",
         ]
     })
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINT: /tts-config  — read & write TTS settings live
+# ════════════════════════════════════════════════════════════
+@app.route('/tts-config', methods=['GET', 'POST', 'OPTIONS'])
+def tts_config():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    if request.method == 'GET':
+        cfg = get_tts_config()
+        return jsonify({"success": True, "config": cfg})
+
+    # POST — update one or more fields
+    try:
+        updates = request.get_json() or {}
+        allowed = set(TTS_DEFAULTS.keys())
+        filtered = {k: v for k, v in updates.items() if k in allowed}
+        if not filtered:
+            return jsonify({"error": f"No valid fields. Allowed: {sorted(allowed)}"}), 400
+
+        db.collection("config").document("tts_settings").set(filtered, merge=True)
+        cfg = get_tts_config()
+        print(f"[tts-config] Updated: {filtered}")
+        return jsonify({"success": True, "updated": filtered, "current_config": cfg})
+
+    except Exception as e:
+        import traceback; print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/')
