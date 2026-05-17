@@ -258,6 +258,46 @@ def parse_json_response(text):
         return None
 
 
+def detect_reply_tone(ai_reply):
+    """
+    Analyses the AI's own reply using VADER sentiment to decide how long the
+    frontend should pause before playing the audio — simulating a therapist
+    who takes a breath before delivering something heavy.
+
+    We analyse the AI reply (not the user message) because the AI knows what
+    it's about to say — empathetic/validating replies need more pre-speech space,
+    quick follow-up questions need less.
+
+    Returns (tone, pause_ms):
+      "heavy"  — compound ≤ -0.4  → 1600ms  (empathetic, validating, emotional)
+      "normal" — compound -0.4–0.1 → 900ms  (neutral, exploratory, Socratic)
+      "brief"  — compound > 0.1   →  400ms  (encouraging, confirming, upbeat)
+    """
+    try:
+        import nltk
+        from nltk.sentiment.vader import SentimentIntensityAnalyzer
+        try:
+            sia = SentimentIntensityAnalyzer()
+        except LookupError:
+            nltk.download('vader_lexicon', quiet=True)
+            sia = SentimentIntensityAnalyzer()
+
+        scores = sia.polarity_scores(ai_reply)
+        compound = scores['compound']
+        print(f"[tone] VADER on AI reply — compound={compound:.3f} | text: {ai_reply[:80]}")
+
+        if compound <= -0.4:
+            return "heavy", 1600
+        elif compound <= 0.1:
+            return "normal", 900
+        else:
+            return "brief", 400
+
+    except Exception as e:
+        print(f"[tone] VADER failed, defaulting to normal: {e}")
+        return "normal", 900
+
+
 def split_into_sentences(text):
     parts = re.split(r'(?<=[.!?])\s+', text.strip())
     return [p.strip() for p in parts if p.strip()]
@@ -653,11 +693,16 @@ def therapy_session():
         db.collection("users").document(user_id) \
           .collection("therapy_sessions").document(session_id).update(update_payload)
 
+        tone, pause_ms = detect_reply_tone(ai_reply)
+        print(f"[tone] → {tone} | pause {pause_ms}ms before speaking")
+
         return jsonify({
             "session_id": session_id, "reply": ai_reply,
             "phase": next_phase, "session_complete": session_complete,
             "extracted": merged,
-            "turn_count": len([m for m in messages if m["role"] == "user"])
+            "turn_count": len([m for m in messages if m["role"] == "user"]),
+            "tone": tone,
+            "pause_ms": pause_ms,
         })
 
     except Exception as e:
