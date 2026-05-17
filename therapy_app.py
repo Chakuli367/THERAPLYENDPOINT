@@ -62,27 +62,12 @@ if not GOOGLE_TTS_KEY:
 
 GOOGLE_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 
-# ── CHANGE 1: Chirp HD — Google's most expressive, human-like voice ──
-# Chirp HD (formerly "Journey") is built on DeepMind audio research.
-# It captures natural intonation, emotional range, and human disfluencies.
-# NOTE: Chirp HD does NOT support speakingRate or pitch — it handles those naturally.
-#
-# Available Chirp HD voices (pick one):
-#   "en-US-Chirp-HD-F"  — warm, expressive female (best for therapy)
-#   "en-US-Chirp-HD-O"  — calm, measured female
-#   "en-US-Chirp-HD-D"  — calm, measured male
+# Chirp HD — Google's most expressive, human-like voice.
+# IMPORTANT: Chirp HD does NOT support SSML or speakingRate/pitch params.
+# It renders natural prosody from punctuation and conversational phrasing alone.
 GOOGLE_TTS_VOICE = "en-US-Chirp-HD-F"
 
 # ── Prompts ───────────────────────────────────────────────────
-
-# ── CHANGE 2: Spoken-word system prompt ──
-# The original prompt produced written text that sounded clinical when spoken.
-# This version instructs the LLM to write for the ear, not the eye:
-# - contractions always
-# - short punchy sentences
-# - natural warmth openers
-# - trailing questions to invite response
-# - NEVER the stiff "I understand" opener
 THERAPY_SYSTEM_PROMPT = """You are a compassionate CBT-informed therapist running a structured 4-phase mini-session.
 
 RULES:
@@ -161,17 +146,21 @@ def parse_json_response(text):
         return None
 
 
-# ── CHANGE 3: SSML-aware text cleaner ──
-# Instead of stripping everything and sending plain text,
-# we now inject SSML pause markers and wrap in <speak> tags.
-# Chirp HD supports SSML fully, and pauses are what make speech feel human.
-#
-# Pause guide:
-#   "..."  → 600ms pause (mid-thought hesitation)
-#   "—"    → 300ms pause (em-dash breath)
-#   ","    → light prosodic break (handled naturally by Chirp HD, no explicit tag needed)
 def clean_text_for_tts(text: str) -> str:
-    # Strip markdown formatting
+    """
+    Prepare plain text for Chirp HD.
+
+    Chirp HD does NOT support SSML — sending <speak> tags or speakingRate/pitch
+    causes a 400 INVALID_ARGUMENT error.
+
+    Instead, we shape prosody through punctuation, which Chirp HD reads naturally:
+      - "..."  → ", "  (comma = natural hesitation pause)
+      - "—"    → ", "  (breath before continuing)
+      - Conversational openers like "Yeah," and "Okay so," already carry
+        natural intonation — Chirp HD is trained on real speech and handles
+        warmth and rhythm from text content alone.
+    """
+    # Strip markdown
     text = re.sub(r'\*\*?(.*?)\*\*?', r'\1', text)
     text = re.sub(r'^\s*[-•*]\s+', '', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
@@ -179,21 +168,16 @@ def clean_text_for_tts(text: str) -> str:
     text = re.sub(r'\[.*?\]|\(.*?\)', '', text)
     text = re.sub(r'\n{2,}', ' ', text)
     text = re.sub(r'\n', ' ', text)
+
+    # Convert rhythm cues to punctuation Chirp HD understands natively
+    text = text.replace('...', ',')   # mid-thought pause
+    text = text.replace('—', ',')     # breath/break
+
+    # Clean up any double commas that result
+    text = re.sub(r',\s*,', ',', text)
+
     text = re.sub(r'\s{2,}', ' ', text).strip()
-
-    # Inject SSML pause markers for natural rhythm
-    # Ellipses → 600ms pause (thinking/hesitation)
-    text = text.replace('...', '<break time="600ms"/>')
-    # Em-dash → 300ms pause (natural breath)
-    text = text.replace('—', '<break time="300ms"/>')
-    # Question mark followed by space → tiny breath before next sentence
-    text = re.sub(r'\?\s+', '?<break time="200ms"/> ', text)
-
-    # Escape any bare ampersands that would break SSML
-    text = re.sub(r'&(?!amp;|lt;|gt;|quot;|apos;)', '&amp;', text)
-
-    # Wrap in SSML speak tags
-    return f'<speak>{text}</speak>'
+    return text
 
 
 # ════════════════════════════════════════════════════════════
@@ -230,7 +214,7 @@ def transcribe():
 
 
 # ════════════════════════════════════════════════════════════
-# ENDPOINT: /speak  (Google Cloud TTS — Chirp HD + SSML)
+# ENDPOINT: /speak  (Google Cloud TTS — Chirp HD, plain text)
 # ════════════════════════════════════════════════════════════
 @app.route('/speak', methods=['POST', 'OPTIONS'])
 def speak():
@@ -252,30 +236,24 @@ def speak():
         if not GOOGLE_TTS_KEY:
             return jsonify({"error": "GOOGLE_TTS_KEY not configured"}), 500
 
-        # Convert to SSML with natural pause markers
-        ssml_text = clean_text_for_tts(text)
-        print(f"[Google TTS Chirp HD] Synthesizing with voice {GOOGLE_TTS_VOICE}")
-        print(f"[Google TTS Chirp HD] SSML: {ssml_text[:200]}...")
+        # Plain text — Chirp HD does NOT support SSML
+        plain_text = clean_text_for_tts(text)
+        print(f"[Google TTS Chirp HD] Voice: {GOOGLE_TTS_VOICE}")
+        print(f"[Google TTS Chirp HD] Text: {plain_text[:200]}...")
 
-        # ── CHANGE 4: Use SSML input + headphone profile ──
-        # Key differences from original:
-        # 1. "input": {"ssml": ...} instead of {"text": ...}
-        # 2. NO speakingRate — Chirp HD doesn't support it (causes error)
-        # 3. NO pitch — Chirp HD doesn't support it (causes error)
-        # 4. effectsProfileId "headphone-class-device" = richer, warmer audio
         response = http_requests.post(
             f"{GOOGLE_TTS_URL}?key={GOOGLE_TTS_KEY}",
             json={
-                "input": {"ssml": ssml_text},          # SSML, not plain text
+                "input": {"text": plain_text},          # plain text, NOT ssml
                 "voice": {
                     "languageCode": "en-US",
-                    "name": GOOGLE_TTS_VOICE,           # en-US-Chirp-HD-F
+                    "name": GOOGLE_TTS_VOICE,
                 },
                 "audioConfig": {
                     "audioEncoding": "MP3",
-                    "effectsProfileId": ["headphone-class-device"],  # warmer audio
-                    # NO speakingRate — Chirp HD ignores it and may error
-                    # NO pitch — same reason
+                    "effectsProfileId": ["headphone-class-device"],
+                    # NO speakingRate — Chirp HD does not support it
+                    # NO pitch — Chirp HD does not support it
                 }
             },
             timeout=30
@@ -548,7 +526,8 @@ def health():
         "tts_provider": "Google Cloud TTS — Chirp HD",
         "tts_voice": GOOGLE_TTS_VOICE,
         "tts_key_set": bool(GOOGLE_TTS_KEY),
-        "ssml_enabled": True,
+        "ssml_enabled": False,
+        "note": "Chirp HD uses plain text — prosody shaped via punctuation"
     })
 
 
@@ -556,13 +535,8 @@ def health():
 def index():
     return jsonify({
         "status": "Voice therapy backend running ✅",
-        "tts": "Google Cloud TTS — Chirp HD + SSML",
-        "changes": [
-            "Voice: en-US-Chirp-HD-F (most human Google voice)",
-            "SSML: pauses injected at ..., —, and ? boundaries",
-            "LLM prompt: rewritten for spoken-word output",
-            "Audio: headphone-class-device profile for warmth"
-        ]
+        "tts": "Google Cloud TTS — Chirp HD (plain text, no SSML)",
+        "prosody_approach": "Ellipses and em-dashes converted to commas; Chirp HD renders natural rhythm from conversational phrasing"
     })
 
 
