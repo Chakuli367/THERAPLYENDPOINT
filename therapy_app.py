@@ -62,14 +62,27 @@ if not GOOGLE_TTS_KEY:
 
 GOOGLE_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 
-# Voice options (uncomment the one you want):
-# "en-US-Journey-F"   — most expressive, closest to ElevenLabs quality
-# "en-US-Neural2-F"   — warm, natural female (good balance)
-# "en-US-Neural2-C"   — calm, clear female
-# "en-US-Neural2-D"   — deep, calm male
-GOOGLE_TTS_VOICE = "en-US-Neural2-F"  # faster than Journey-F; good quality for therapy
+# ── CHANGE 1: Chirp HD — Google's most expressive, human-like voice ──
+# Chirp HD (formerly "Journey") is built on DeepMind audio research.
+# It captures natural intonation, emotional range, and human disfluencies.
+# NOTE: Chirp HD does NOT support speakingRate or pitch — it handles those naturally.
+#
+# Available Chirp HD voices (pick one):
+#   "en-US-Chirp-HD-F"  — warm, expressive female (best for therapy)
+#   "en-US-Chirp-HD-O"  — calm, measured female
+#   "en-US-Chirp-HD-D"  — calm, measured male
+GOOGLE_TTS_VOICE = "en-US-Chirp-HD-F"
 
 # ── Prompts ───────────────────────────────────────────────────
+
+# ── CHANGE 2: Spoken-word system prompt ──
+# The original prompt produced written text that sounded clinical when spoken.
+# This version instructs the LLM to write for the ear, not the eye:
+# - contractions always
+# - short punchy sentences
+# - natural warmth openers
+# - trailing questions to invite response
+# - NEVER the stiff "I understand" opener
 THERAPY_SYSTEM_PROMPT = """You are a compassionate CBT-informed therapist running a structured 4-phase mini-session.
 
 RULES:
@@ -77,17 +90,28 @@ RULES:
 - Move through phases 1 to 4. Never skip. Never go back.
 - Phase 4 always sets session_complete to true.
 - Keep your "message" SHORT — 2-3 sentences max. You are speaking out loud, not writing.
-- Be warm, human, conversational. No bullet points in message.
+
+SPOKEN VOICE STYLE — CRITICAL:
+- Write for the EAR, not the eye. This will be read aloud by a voice AI.
+- Always use contractions: "you're", "it's", "that's", "I'd", "we'll", "isn't"
+- Use natural warmth openers: "Yeah...", "Okay so...", "Mmm, got it.", "Right, so..."
+- Keep sentences short and punchy. One thought per sentence max.
+- Occasionally end with a soft trailing question: "...yeah?" or "...right?" or "does that feel accurate?"
+- Add "..." where a human would naturally pause mid-thought.
+- NEVER start with "I understand" or "That sounds difficult" — too stiff and clinical.
+- NEVER use bullet points, lists, or headers in your message.
+- BAD example: "I understand that social situations can be quite challenging for you."
+- GOOD example: "Okay so... that meeting's really getting to you. What's going through your head when you think about it?"
 
 PHASE GUIDE:
 Phase 1 (Understanding): Ask the user to describe the situation making them anxious. Extract: situation, anxious_thought, emotion.
 Phase 2 (Challenging): Gently challenge the anxious thought using Socratic questioning. Extract: reframe.
 Phase 3 (Planning): Help the user commit to one specific action. Extract: proposed_task name, type, why.
-Phase 4 (Committing): Confirm the plan, set session_complete to true. Give a warm closing.
+Phase 4 (Committing): Confirm the plan, set session_complete to true. Give a warm, brief closing.
 
 RESPONSE FORMAT (always return this exact JSON):
 {
-  "message": "your spoken reply — short, warm, conversational",
+  "message": "your spoken reply — short, warm, conversational, written for the ear",
   "phase": 1,
   "session_complete": false,
   "extracted": {
@@ -136,16 +160,40 @@ def parse_json_response(text):
     except Exception:
         return None
 
+
+# ── CHANGE 3: SSML-aware text cleaner ──
+# Instead of stripping everything and sending plain text,
+# we now inject SSML pause markers and wrap in <speak> tags.
+# Chirp HD supports SSML fully, and pauses are what make speech feel human.
+#
+# Pause guide:
+#   "..."  → 600ms pause (mid-thought hesitation)
+#   "—"    → 300ms pause (em-dash breath)
+#   ","    → light prosodic break (handled naturally by Chirp HD, no explicit tag needed)
 def clean_text_for_tts(text: str) -> str:
+    # Strip markdown formatting
     text = re.sub(r'\*\*?(.*?)\*\*?', r'\1', text)
     text = re.sub(r'^\s*[-•*]\s+', '', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
     text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)
     text = re.sub(r'\[.*?\]|\(.*?\)', '', text)
-    text = re.sub(r'\n{2,}', '. ', text)
+    text = re.sub(r'\n{2,}', ' ', text)
     text = re.sub(r'\n', ' ', text)
     text = re.sub(r'\s{2,}', ' ', text).strip()
-    return text
+
+    # Inject SSML pause markers for natural rhythm
+    # Ellipses → 600ms pause (thinking/hesitation)
+    text = text.replace('...', '<break time="600ms"/>')
+    # Em-dash → 300ms pause (natural breath)
+    text = text.replace('—', '<break time="300ms"/>')
+    # Question mark followed by space → tiny breath before next sentence
+    text = re.sub(r'\?\s+', '?<break time="200ms"/> ', text)
+
+    # Escape any bare ampersands that would break SSML
+    text = re.sub(r'&(?!amp;|lt;|gt;|quot;|apos;)', '&amp;', text)
+
+    # Wrap in SSML speak tags
+    return f'<speak>{text}</speak>'
 
 
 # ════════════════════════════════════════════════════════════
@@ -182,7 +230,7 @@ def transcribe():
 
 
 # ════════════════════════════════════════════════════════════
-# ENDPOINT: /speak  (Google Cloud TTS)
+# ENDPOINT: /speak  (Google Cloud TTS — Chirp HD + SSML)
 # ════════════════════════════════════════════════════════════
 @app.route('/speak', methods=['POST', 'OPTIONS'])
 def speak():
@@ -204,22 +252,30 @@ def speak():
         if not GOOGLE_TTS_KEY:
             return jsonify({"error": "GOOGLE_TTS_KEY not configured"}), 500
 
-        cleaned_text = clean_text_for_tts(text)
-        print(f"[Google TTS] Synthesizing {len(cleaned_text)} chars with voice {GOOGLE_TTS_VOICE}")
+        # Convert to SSML with natural pause markers
+        ssml_text = clean_text_for_tts(text)
+        print(f"[Google TTS Chirp HD] Synthesizing with voice {GOOGLE_TTS_VOICE}")
+        print(f"[Google TTS Chirp HD] SSML: {ssml_text[:200]}...")
 
+        # ── CHANGE 4: Use SSML input + headphone profile ──
+        # Key differences from original:
+        # 1. "input": {"ssml": ...} instead of {"text": ...}
+        # 2. NO speakingRate — Chirp HD doesn't support it (causes error)
+        # 3. NO pitch — Chirp HD doesn't support it (causes error)
+        # 4. effectsProfileId "headphone-class-device" = richer, warmer audio
         response = http_requests.post(
             f"{GOOGLE_TTS_URL}?key={GOOGLE_TTS_KEY}",
             json={
-                "input": {"text": cleaned_text},
+                "input": {"ssml": ssml_text},          # SSML, not plain text
                 "voice": {
                     "languageCode": "en-US",
-                    "name": GOOGLE_TTS_VOICE,
+                    "name": GOOGLE_TTS_VOICE,           # en-US-Chirp-HD-F
                 },
                 "audioConfig": {
                     "audioEncoding": "MP3",
-                    "speakingRate": 0.92,   # slightly slower = more therapeutic
-                    "pitch": -1.0,          # calmer feel (supported by Neural2)
-                    "volumeGainDb": 0.0,
+                    "effectsProfileId": ["headphone-class-device"],  # warmer audio
+                    # NO speakingRate — Chirp HD ignores it and may error
+                    # NO pitch — same reason
                 }
             },
             timeout=30
@@ -230,7 +286,7 @@ def speak():
             return jsonify({"error": f"Google TTS error {response.status_code}: {response.text}"}), 503
 
         audio_bytes = base64.b64decode(response.json()["audioContent"])
-        print(f"[Google TTS] ✅ Success — {len(audio_bytes)} bytes")
+        print(f"[Google TTS Chirp HD] ✅ Success — {len(audio_bytes)} bytes")
 
         return Response(
             audio_bytes,
@@ -309,7 +365,7 @@ def therapy_session():
             "content": (
                 f"CURRENT PHASE: {current_phase}\n"
                 f"EXTRACTED SO FAR: {json.dumps(extracted_so_far)}\n"
-                "Respond with valid JSON only."
+                "Respond with valid JSON only. Remember: write the message for the EAR — short, warm, conversational."
             )
         }
         messages_for_model = [messages[0], phase_reminder] + messages[1:]
@@ -489,15 +545,25 @@ def therapy_session_history():
 def health():
     return jsonify({
         "status": "ok",
-        "tts_provider": "Google Cloud TTS",
+        "tts_provider": "Google Cloud TTS — Chirp HD",
         "tts_voice": GOOGLE_TTS_VOICE,
         "tts_key_set": bool(GOOGLE_TTS_KEY),
+        "ssml_enabled": True,
     })
 
 
 @app.route('/')
 def index():
-    return jsonify({"status": "Voice therapy backend running ✅", "tts": "Google Cloud TTS"})
+    return jsonify({
+        "status": "Voice therapy backend running ✅",
+        "tts": "Google Cloud TTS — Chirp HD + SSML",
+        "changes": [
+            "Voice: en-US-Chirp-HD-F (most human Google voice)",
+            "SSML: pauses injected at ..., —, and ? boundaries",
+            "LLM prompt: rewritten for spoken-word output",
+            "Audio: headphone-class-device profile for warmth"
+        ]
+    })
 
 
 if __name__ == '__main__':
