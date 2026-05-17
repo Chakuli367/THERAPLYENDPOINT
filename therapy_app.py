@@ -112,6 +112,38 @@ TTS_DEFAULTS = {
     "effects_profile":    "headphone-class-device",
 }
 
+# ── All available Chirp HD voices for the test page ──────────
+AVAILABLE_VOICES = [
+    "en-US-Chirp-HD-O",
+    "en-US-Chirp-HD-D",
+    "en-US-Chirp-HD-F",
+    "en-US-Chirp3-HD-Achernar",
+    "en-US-Chirp3-HD-Aoede",
+    "en-US-Chirp3-HD-Callirrhoe",
+    "en-US-Chirp3-HD-Charon",
+    "en-US-Chirp3-HD-Despina",
+    "en-US-Chirp3-HD-Enceladus",
+    "en-US-Chirp3-HD-Erinome",
+    "en-US-Chirp3-HD-Fenrir",
+    "en-US-Chirp3-HD-Gacrux",
+    "en-US-Chirp3-HD-Iapetus",
+    "en-US-Chirp3-HD-Kore",
+    "en-US-Chirp3-HD-Laomedeia",
+    "en-US-Chirp3-HD-Leda",
+    "en-US-Chirp3-HD-Orus",
+    "en-US-Chirp3-HD-Puck",
+    "en-US-Chirp3-HD-Pulcherrima",
+    "en-US-Chirp3-HD-Rasalgethi",
+    "en-US-Chirp3-HD-Sadachbia",
+    "en-US-Chirp3-HD-Sadaltager",
+    "en-US-Chirp3-HD-Schedar",
+    "en-US-Chirp3-HD-Sulafat",
+    "en-US-Chirp3-HD-Umbriel",
+    "en-US-Chirp3-HD-Vindemiatrix",
+    "en-US-Chirp3-HD-Zephyr",
+    "en-US-Chirp3-HD-Zubenelgenubi",
+]
+
 # ── Silent MP3 padding helper ─────────────────────────────────
 SILENCE_PADDING_MS = 3000  # 3 seconds
 
@@ -127,15 +159,9 @@ print(f"[silence] ffmpeg available: {_HAS_FFMPEG}")
 
 
 def append_silence(audio_bytes, silence_ms=SILENCE_PADDING_MS):
-    """
-    Append silence to an MP3 by writing it via ffmpeg concat so the output
-    is a single valid MP3 file (no header/frame corruption).
-    Falls back to returning the original bytes unchanged if ffmpeg is absent.
-    """
     if not _HAS_FFMPEG:
         print("[silence] ffmpeg not found — skipping silence padding")
         return audio_bytes
-
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             speech_path  = os.path.join(tmpdir, "speech.mp3")
@@ -143,25 +169,21 @@ def append_silence(audio_bytes, silence_ms=SILENCE_PADDING_MS):
             output_path  = os.path.join(tmpdir, "output.mp3")
             list_path    = os.path.join(tmpdir, "concat.txt")
 
-            # Write the speech MP3
             with open(speech_path, "wb") as f:
                 f.write(audio_bytes)
 
-            # Generate silence MP3 with ffmpeg
             subprocess.run([
                 "ffmpeg", "-y",
                 "-f", "lavfi",
-                "-i", f"anullsrc=r=24000:cl=mono",
+                "-i", "anullsrc=r=24000:cl=mono",
                 "-t", str(silence_ms / 1000),
                 "-c:a", "libmp3lame", "-b:a", "128k", "-q:a", "4",
                 silence_path
             ], capture_output=True, timeout=10, check=True)
 
-            # Concat list
             with open(list_path, "w") as f:
                 f.write(f"file '{speech_path}'\nfile '{silence_path}'\n")
 
-            # Merge both into one MP3
             subprocess.run([
                 "ffmpeg", "-y",
                 "-f", "concat", "-safe", "0",
@@ -175,24 +197,16 @@ def append_silence(audio_bytes, silence_ms=SILENCE_PADDING_MS):
 
         print(f"[silence] appended {silence_ms}ms — {len(audio_bytes)}b → {len(result)}b")
         return result
-
     except Exception as e:
         print(f"[silence] ffmpeg failed, returning original audio: {e}")
         return audio_bytes
 
 
 def merge_mp3s(chunks):
-    """
-    Merge a list of MP3 byte-strings into one valid MP3 using ffmpeg concat.
-    Falls back to raw concatenation if ffmpeg is absent (works for most players
-    when all chunks share the same bitrate/samplerate).
-    """
     if len(chunks) == 1:
         return chunks[0]
-
     if not _HAS_FFMPEG:
         return b"".join(chunks)
-
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
             list_path   = os.path.join(tmpdir, "concat.txt")
@@ -215,7 +229,6 @@ def merge_mp3s(chunks):
 
             with open(output_path, "rb") as f:
                 return f.read()
-
     except Exception as e:
         print(f"[merge_mp3s] ffmpeg failed, raw concat: {e}")
         return b"".join(chunks)
@@ -255,13 +268,7 @@ def build_audio_config(cfg):
 
 # ── Thinking fillers ──────────────────────────────────────────
 THINKING_FILLERS = [
-    "Mmm.",
-    "Yeah.",
-    "Right.",
-    "Okay.",
-    "Got it.",
-    "Mmm, okay.",
-    "Yeah, okay.",
+    "Mmm.", "Yeah.", "Right.", "Okay.", "Got it.", "Mmm, okay.", "Yeah, okay.",
 ]
 
 # ── Prompts ───────────────────────────────────────────────────
@@ -372,7 +379,6 @@ def detect_reply_tone(ai_reply):
             return "normal", 900
         else:
             return "brief", 400
-
     except Exception as e:
         print(f"[tone] VADER failed, defaulting to normal: {e}")
         return "normal", 900
@@ -391,11 +397,9 @@ def clean_sentence_for_tts(text):
     text = re.sub(r'\[.*?\]|\(.*?\)', '', text)
     text = re.sub(r'\n{2,}', ' ', text)
     text = re.sub(r'\n', ' ', text)
-
     text = text.replace('...', '. ')
     text = text.replace('\u2014', ', ')
     text = text.replace(' - ', ', ')
-
     text = re.sub(r'\.\s*\.', '.', text)
     text = re.sub(r',\s*,', ',', text)
 
@@ -461,7 +465,6 @@ def emotion_aware_preprocess(text, cfg=None):
 
 
 def synthesize_sentence(sentence, cfg=None):
-    """Call Google TTS for a single sentence. Returns MP3 bytes or None."""
     if cfg is None:
         cfg = TTS_DEFAULTS
     if not GOOGLE_TTS_KEY:
@@ -544,7 +547,7 @@ def speak():
         filled = add_thinking_filler(clean, cfg)
         final = emotion_aware_preprocess(filled, cfg)
 
-        print(f"[Google TTS] Voice: {cfg['voice']} | Chirp-HD: {'Chirp-HD' in cfg['voice']} | Text: {final[:120]}")
+        print(f"[Google TTS] Voice: {cfg['voice']} | Text: {final[:120]}")
 
         response = http_requests.post(
             f"{GOOGLE_TTS_URL}?key={GOOGLE_TTS_KEY}",
@@ -561,7 +564,6 @@ def speak():
             return jsonify({"error": f"Google TTS error {response.status_code}: {response.text}"}), 503
 
         audio_bytes = base64.b64decode(response.json()["audioContent"])
-        # Append 3 seconds of proper silence using ffmpeg so the MP3 stays valid.
         padded_audio = append_silence(audio_bytes)
         print(f"[Google TTS] OK — padded to {len(padded_audio)} bytes total")
 
@@ -616,8 +618,6 @@ def speak_stream():
         print(f"[speak-stream] {len(sentences)} sentence(s) → voice: {cfg['voice']}")
 
         def generate():
-            # Collect all sentence audio first, then merge with silence via ffmpeg
-            # so the final MP3 is a single valid file (no frame corruption).
             chunks = []
             for i, sentence in enumerate(sentences):
                 if not sentence.strip():
@@ -633,10 +633,8 @@ def speak_stream():
             if len(chunks) == 1:
                 combined_bytes = chunks[0]
             else:
-                # Concatenate sentence MP3s properly with ffmpeg
                 combined_bytes = merge_mp3s(chunks)
 
-            # Append 3 seconds of proper silence
             final_bytes = append_silence(combined_bytes)
             print(f"[speak-stream] streaming {len(final_bytes)} bytes total (incl. 3s silence)")
             yield final_bytes
@@ -657,6 +655,470 @@ def speak_stream():
 
 
 # ════════════════════════════════════════════════════════════
+# ENDPOINT: /speak-test  — raw voice tester, no fillers/processing
+# ════════════════════════════════════════════════════════════
+@app.route('/speak-test', methods=['POST', 'OPTIONS'])
+def speak_test():
+    """
+    Voice testing endpoint. Reads any text exactly as given — no fillers,
+    no emotion processing, no digit conversion. Supports overriding the voice
+    per-request so you can compare voices without touching Firebase config.
+
+    POST body:
+      {
+        "text":  "Any text of any length you want to hear.",
+        "voice": "en-US-Chirp3-HD-Aoede"   // optional — overrides Firebase setting
+      }
+    """
+    if request.method == 'OPTIONS':
+        res = Response()
+        res.headers['Access-Control-Allow-Origin'] = '*'
+        res.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        res.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        res.headers['Access-Control-Max-Age'] = '3600'
+        res.status_code = 200
+        return res
+
+    try:
+        data = request.get_json()
+        text = (data.get("text") or "").strip()
+        if not text:
+            return jsonify({"error": "No text provided"}), 400
+        if not GOOGLE_TTS_KEY:
+            return jsonify({"error": "GOOGLE_TTS_KEY not configured"}), 500
+
+        # Use the live Firebase config as base, then override voice if supplied
+        cfg = get_tts_config()
+        override_voice = (data.get("voice") or "").strip()
+        if override_voice:
+            cfg["voice"] = override_voice
+
+        # Split into sentences so long texts don't hit the 5000-byte TTS limit
+        sentences = split_into_sentences(text) or [text]
+        print(f"[speak-test] {len(sentences)} sentence(s) | voice: {cfg['voice']}")
+
+        chunks = []
+        for i, sentence in enumerate(sentences):
+            if not sentence.strip():
+                continue
+            chunk = synthesize_sentence(sentence, cfg)
+            if chunk:
+                print(f"[speak-test] chunk {i+1}/{len(sentences)}: {len(chunk)} bytes")
+                chunks.append(chunk)
+
+        if not chunks:
+            return jsonify({"error": "TTS produced no audio"}), 500
+
+        combined = chunks[0] if len(chunks) == 1 else merge_mp3s(chunks)
+
+        # No silence tail on the test endpoint — just the raw speech
+        print(f"[speak-test] returning {len(combined)} bytes | voice: {cfg['voice']}")
+        return Response(
+            combined,
+            mimetype="audio/mpeg",
+            headers={
+                "Content-Type": "audio/mpeg",
+                "Access-Control-Allow-Origin": "*",
+                "X-Voice-Used": cfg["voice"],
+            }
+        )
+
+    except Exception as e:
+        import traceback; print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINT: /voices  — list all testable voices
+# ════════════════════════════════════════════════════════════
+@app.route('/voices', methods=['GET'])
+def list_voices():
+    cfg = get_tts_config()
+    return jsonify({
+        "current_voice": cfg["voice"],
+        "available_voices": AVAILABLE_VOICES,
+    })
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINT: /voice-test-ui  — browser UI for voice testing
+# ════════════════════════════════════════════════════════════
+@app.route('/voice-test-ui', methods=['GET'])
+def voice_test_ui():
+    voices_json = json.dumps(AVAILABLE_VOICES)
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Voice Tester — Theraply</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=DM+Mono:wght@400;500&display=swap');
+
+  *, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
+
+  :root {{
+    --bg:        #0d0f14;
+    --surface:   #13161e;
+    --border:    #1f2430;
+    --accent:    #7c6af7;
+    --accent2:   #a78bfa;
+    --text:      #e8e6f0;
+    --muted:     #6b6880;
+    --success:   #4ade80;
+    --warn:      #fb923c;
+  }}
+
+  body {{
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'DM Mono', monospace;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 48px 24px 80px;
+  }}
+
+  header {{
+    text-align: center;
+    margin-bottom: 48px;
+  }}
+
+  header h1 {{
+    font-family: 'DM Serif Display', serif;
+    font-size: clamp(2rem, 5vw, 3.2rem);
+    font-style: italic;
+    background: linear-gradient(135deg, var(--accent2), var(--accent));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    letter-spacing: -0.02em;
+  }}
+
+  header p {{
+    color: var(--muted);
+    font-size: 0.8rem;
+    margin-top: 8px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }}
+
+  .card {{
+    width: 100%;
+    max-width: 760px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 32px;
+    margin-bottom: 24px;
+  }}
+
+  label {{
+    display: block;
+    font-size: 0.72rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 10px;
+  }}
+
+  select, textarea {{
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text);
+    font-family: 'DM Mono', monospace;
+    font-size: 0.88rem;
+    padding: 14px 16px;
+    outline: none;
+    transition: border-color 0.2s;
+    appearance: none;
+  }}
+
+  select:focus, textarea:focus {{
+    border-color: var(--accent);
+  }}
+
+  select {{
+    cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' fill='none'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%236b6880' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 16px center;
+    padding-right: 40px;
+  }}
+
+  textarea {{
+    height: 200px;
+    resize: vertical;
+    line-height: 1.7;
+  }}
+
+  .row {{
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-bottom: 24px;
+  }}
+
+  .field {{ margin-bottom: 24px; }}
+  .field:last-child {{ margin-bottom: 0; }}
+
+  .char-count {{
+    font-size: 0.72rem;
+    color: var(--muted);
+    text-align: right;
+    margin-top: 6px;
+  }}
+
+  .char-count.warn {{ color: var(--warn); }}
+
+  button {{
+    width: 100%;
+    padding: 16px;
+    border: none;
+    border-radius: 12px;
+    font-family: 'DM Mono', monospace;
+    font-size: 0.9rem;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+    transition: all 0.2s;
+  }}
+
+  #playBtn {{
+    background: linear-gradient(135deg, var(--accent), #5b4fd4);
+    color: #fff;
+    font-weight: 500;
+  }}
+
+  #playBtn:hover:not(:disabled) {{
+    transform: translateY(-2px);
+    box-shadow: 0 8px 32px rgba(124, 106, 247, 0.4);
+  }}
+
+  #playBtn:disabled {{
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+  }}
+
+  .status-bar {{
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 18px;
+    border-radius: 10px;
+    font-size: 0.8rem;
+    margin-top: 20px;
+    border: 1px solid var(--border);
+    min-height: 50px;
+    transition: all 0.3s;
+  }}
+
+  .status-bar.idle   {{ background: transparent; color: var(--muted); }}
+  .status-bar.loading {{ background: rgba(124,106,247,0.08); color: var(--accent2); border-color: var(--accent); }}
+  .status-bar.playing {{ background: rgba(74,222,128,0.08); color: var(--success); border-color: var(--success); }}
+  .status-bar.error  {{ background: rgba(251,146,60,0.08); color: var(--warn); border-color: var(--warn); }}
+
+  .dot {{
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: currentColor;
+  }}
+
+  .dot.pulse {{ animation: pulse 1.2s ease-in-out infinite; }}
+
+  @keyframes pulse {{
+    0%, 100% {{ opacity: 1; transform: scale(1); }}
+    50% {{ opacity: 0.4; transform: scale(0.7); }}
+  }}
+
+  .voice-badge {{
+    display: inline-block;
+    background: rgba(124,106,247,0.15);
+    color: var(--accent2);
+    border: 1px solid rgba(124,106,247,0.3);
+    border-radius: 6px;
+    padding: 3px 10px;
+    font-size: 0.72rem;
+    letter-spacing: 0.06em;
+    margin-top: 8px;
+  }}
+
+  .presets {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+  }}
+
+  .preset {{
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--muted);
+    font-family: 'DM Mono', monospace;
+    font-size: 0.72rem;
+    padding: 6px 12px;
+    cursor: pointer;
+    transition: all 0.15s;
+    letter-spacing: 0.04em;
+  }}
+
+  .preset:hover {{
+    border-color: var(--accent);
+    color: var(--accent2);
+  }}
+
+  audio {{ width: 100%; margin-top: 16px; border-radius: 8px; }}
+  audio::-webkit-media-controls-panel {{ background: var(--surface); }}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Voice Tester</h1>
+  <p>Theraply · Raw TTS Preview</p>
+</header>
+
+<div class="card">
+  <div class="row">
+    <div class="field">
+      <label>Voice</label>
+      <select id="voiceSelect"></select>
+      <div class="voice-badge" id="voiceBadge">loading...</div>
+    </div>
+    <div class="field">
+      <label>Preset Phrases</label>
+      <div class="presets">
+        <button class="preset" onclick="setPreset('therapy-open')">Therapy opener</button>
+        <button class="preset" onclick="setPreset('therapy-reframe')">CBT reframe</button>
+        <button class="preset" onclick="setPreset('long')">Long passage</button>
+        <button class="preset" onclick="setPreset('fillers')">With fillers</button>
+        <button class="preset" onclick="setPreset('numbers')">Numbers/digits</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="field">
+    <label>Text to speak</label>
+    <textarea id="textInput" placeholder="Type or paste any text here — as long as you like. The voice will read it all."></textarea>
+    <div class="char-count" id="charCount">0 characters</div>
+  </div>
+
+  <button id="playBtn" onclick="synthesise()">▶ Synthesise &amp; Play</button>
+
+  <div class="status-bar idle" id="statusBar">
+    <div class="dot"></div>
+    <span id="statusText">Ready — enter text and hit play</span>
+  </div>
+
+  <audio id="player" controls style="display:none"></audio>
+</div>
+
+<script>
+const VOICES = {voices_json};
+const PRESETS = {{
+  'therapy-open':   "So you've been carrying this for a while... I can hear it. What's the one thing that's been sitting heaviest on your chest this week, yeah?",
+  'therapy-reframe': "Right, so here's what I'm noticing. That thought — that you'll definitely fail — it's loud. But loudness isn't the same as truth. What would you say to a friend who told you that exact thing?",
+  'long':           "Okay so let's slow down for a second. You've shared a lot, and I want to make sure I've really heard you. The meeting on Thursday is worrying you. You're convinced your boss thinks you're not performing well. And underneath all of that, there's this fear that you're going to lose your job. That's a lot to be carrying around all week. I'm curious though — when you imagine the meeting actually happening, what's the very first thought that shows up? Not the second or the third. The very first one.",
+  'fillers':        "Mmm, okay. Yeah, that makes sense. Right, so what you're describing is a really common pattern. Got it. And the anxiety tends to peak right before the event, yeah?",
+  'numbers':        "We'll start with just 5 minutes. Then 10. By the third session you might aim for 20 or 30 minutes without checking your phone.",
+}};
+
+// Populate voice dropdown
+const sel = document.getElementById('voiceSelect');
+VOICES.forEach(v => {{
+  const opt = document.createElement('option');
+  opt.value = v;
+  opt.textContent = v.replace('en-US-', '');
+  sel.appendChild(opt);
+}});
+
+// Try to match the current Firebase voice
+fetch('/voices').then(r => r.json()).then(d => {{
+  const cur = d.current_voice;
+  sel.value = cur;
+  document.getElementById('voiceBadge').textContent = cur;
+}}).catch(() => {{}});
+
+sel.addEventListener('change', () => {{
+  document.getElementById('voiceBadge').textContent = sel.value;
+}});
+
+// Char counter
+const ta = document.getElementById('textInput');
+const cc = document.getElementById('charCount');
+ta.addEventListener('input', () => {{
+  const n = ta.value.length;
+  cc.textContent = n + ' character' + (n === 1 ? '' : 's');
+  cc.classList.toggle('warn', n > 3000);
+}});
+
+function setPreset(key) {{
+  ta.value = PRESETS[key] || '';
+  ta.dispatchEvent(new Event('input'));
+}}
+
+function setStatus(state, msg) {{
+  const bar = document.getElementById('statusBar');
+  bar.className = 'status-bar ' + state;
+  document.getElementById('statusText').textContent = msg;
+  bar.querySelector('.dot').className = 'dot' + (state === 'loading' ? ' pulse' : '');
+}}
+
+async function synthesise() {{
+  const text = ta.value.trim();
+  if (!text) {{ setStatus('error', 'Please enter some text first.'); return; }}
+
+  const voice = sel.value;
+  const btn   = document.getElementById('playBtn');
+  const player = document.getElementById('player');
+
+  btn.disabled = true;
+  player.style.display = 'none';
+  setStatus('loading', 'Sending to Google TTS — ' + voice.replace('en-US-', '') + '...');
+
+  try {{
+    const res = await fetch('/speak-test', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ text, voice }})
+    }});
+
+    if (!res.ok) {{
+      const err = await res.json().catch(() => ({{}}));
+      throw new Error(err.error || 'HTTP ' + res.status);
+    }}
+
+    const blob = await res.blob();
+    const url  = URL.createObjectURL(blob);
+    player.src = url;
+    player.style.display = 'block';
+    player.play();
+    setStatus('playing', 'Playing — ' + voice.replace('en-US-', ''));
+
+    player.onended = () => setStatus('idle', 'Done — ready for next test');
+  }} catch(e) {{
+    setStatus('error', 'Error: ' + e.message);
+  }} finally {{
+    btn.disabled = false;
+  }}
+}}
+
+// Allow Ctrl+Enter to trigger play
+ta.addEventListener('keydown', e => {{
+  if (e.ctrlKey && e.key === 'Enter') synthesise();
+}});
+</script>
+</body>
+</html>"""
+    return Response(html, mimetype="text/html")
+
+
+# ════════════════════════════════════════════════════════════
 # ENDPOINT: /therapy-session
 # ════════════════════════════════════════════════════════════
 @app.route('/therapy-session', methods=['POST', 'OPTIONS'])
@@ -669,24 +1131,23 @@ def therapy_session():
         user_message = data.get("message", "").strip()
         session_id = data.get("session_id")
         start_new = data.get("start_new", False)
-        # Default changed to "long" so responses are richer out of the box
-        response_length = data.get("response_length", "long")  # "short" | "medium" | "long"
+        response_length = data.get("response_length", "long")
 
         if not user_id or not user_message:
             return jsonify({"error": "user_id and message required"}), 400
 
         if not session_id or start_new:
             session_id = f"therapy_{user_id}_{int(datetime.now().timestamp())}"
-            session_data = {
+            session_data = {{
                 "session_id": session_id, "user_id": user_id,
                 "messages": [], "phase": 1,
-                "extracted": {
+                "extracted": {{
                     "situation": "", "anxious_thought": "", "emotion": "", "reframe": "",
-                    "proposed_task": {"name": "", "type": "", "why": "", "anxiety_pre": 5, "action_steps": []}
-                },
+                    "proposed_task": {{"name": "", "type": "", "why": "", "anxiety_pre": 5, "action_steps": []}}
+                }},
                 "session_complete": False,
                 "created_at": datetime.utcnow().isoformat()
-            }
+            }}
             db.collection("users").document(user_id) \
               .collection("therapy_sessions").document(session_id).set(session_data)
         else:
@@ -697,30 +1158,24 @@ def therapy_session():
             session_data = doc.to_dict()
 
         if session_data.get("session_complete"):
-            return jsonify({
+            return jsonify({{
                 "session_id": session_id, "reply": "This session is complete.",
                 "phase": 5, "session_complete": True,
-                "extracted": session_data.get("extracted", {})
-            })
+                "extracted": session_data.get("extracted", {{}})
+            }})
 
         messages = session_data.get("messages", [])
         if len(messages) == 0:
-            messages = [{"role": "system", "content": THERAPY_SYSTEM_PROMPT}]
+            messages = [{{"role": "system", "content": THERAPY_SYSTEM_PROMPT}}]
 
-        messages.append({"role": "user", "content": user_message})
+        messages.append({{"role": "user", "content": user_message}})
 
         current_phase = session_data.get("phase", 1)
-        extracted_so_far = session_data.get("extracted", {})
+        extracted_so_far = session_data.get("extracted", {{}})
 
-        length_guide = {
-            "short": (
-                "RESPONSE LENGTH: SHORT — 1 to 2 sentences max. One thought only. "
-                "Get straight to the point. No elaboration."
-            ),
-            "medium": (
-                "RESPONSE LENGTH: MEDIUM — 2 to 3 sentences. One main point plus a follow-up question. "
-                "Warm but concise."
-            ),
+        length_guide = {{
+            "short": "RESPONSE LENGTH: SHORT — 1 to 2 sentences max. One thought only.",
+            "medium": "RESPONSE LENGTH: MEDIUM — 2 to 3 sentences. One main point plus a follow-up question.",
             "long": (
                 "RESPONSE LENGTH: LONG — 5 to 7 sentences. This is what a real therapist sounds like. "
                 "Validate first, then reflect back what you heard in your own words, then gently explore "
@@ -728,21 +1183,20 @@ def therapy_session():
                 "Use natural pauses (...) between thoughts. Do NOT rush to the question — earn it by "
                 "showing you've really heard them first. The person should feel truly seen."
             ),
-        }.get(response_length, "RESPONSE LENGTH: LONG — 5 to 7 sentences.")
+        }}.get(response_length, "RESPONSE LENGTH: LONG — 5 to 7 sentences.")
 
-        # Increased max_tokens for long responses to give the model room to breathe
-        length_tokens = {"short": 200, "medium": 400, "long": 1200}.get(response_length, 1200)
+        length_tokens = {{"short": 200, "medium": 400, "long": 1200}}.get(response_length, 1200)
 
-        phase_reminder = {
+        phase_reminder = {{
             "role": "system",
             "content": (
-                f"CURRENT PHASE: {current_phase}\n"
-                f"EXTRACTED SO FAR: {json.dumps(extracted_so_far)}\n"
-                f"{length_guide}\n"
+                f"CURRENT PHASE: {{current_phase}}\n"
+                f"EXTRACTED SO FAR: {{json.dumps(extracted_so_far)}}\n"
+                f"{{length_guide}}\n"
                 "Respond with valid JSON only. Write the message for the EAR — warm, unhurried, "
                 "conversational. Use short sentences and natural pauses (...)."
             )
-        }
+        }}
         messages_for_model = [messages[0], phase_reminder] + messages[1:]
 
         response = client.chat.completions.create(
@@ -755,25 +1209,25 @@ def therapy_session():
         parsed = parse_json_response(raw_reply)
 
         if not parsed:
-            messages.append({"role": "assistant", "content": raw_reply})
+            messages.append({{"role": "assistant", "content": raw_reply}})
             db.collection("users").document(user_id) \
               .collection("therapy_sessions").document(session_id) \
-              .update({"messages": messages})
-            return jsonify({
+              .update({{"messages": messages}})
+            return jsonify({{
                 "session_id": session_id, "reply": raw_reply,
                 "phase": current_phase, "session_complete": False
-            })
+            }})
 
         ai_reply = parsed.get("message", raw_reply)
         next_phase = parsed.get("phase", current_phase)
         session_complete = parsed.get("session_complete", False)
-        new_extracted = parsed.get("extracted", {})
+        new_extracted = parsed.get("extracted", {{}})
 
-        merged = session_data.get("extracted", {})
+        merged = session_data.get("extracted", {{}})
         for key, val in new_extracted.items():
             if isinstance(val, dict):
                 if key not in merged:
-                    merged[key] = {}
+                    merged[key] = {{}}
                 for subkey, subval in val.items():
                     if subval and subval != "" and subval != 0:
                         merged[key][subkey] = subval
@@ -781,13 +1235,13 @@ def therapy_session():
                 if val and val != "" and val != 0:
                     merged[key] = val
 
-        messages.append({"role": "assistant", "content": ai_reply})
+        messages.append({{"role": "assistant", "content": ai_reply}})
 
-        update_payload = {
+        update_payload = {{
             "messages": messages, "phase": next_phase,
             "extracted": merged, "session_complete": session_complete,
             "updated_at": datetime.utcnow().isoformat()
-        }
+        }}
         if session_complete:
             update_payload["completed_at"] = datetime.utcnow().isoformat()
 
@@ -795,9 +1249,9 @@ def therapy_session():
           .collection("therapy_sessions").document(session_id).update(update_payload)
 
         tone, pause_ms = detect_reply_tone(ai_reply)
-        print(f"[tone] → {tone} | pause {pause_ms}ms before speaking")
+        print(f"[tone] → {{tone}} | pause {{pause_ms}}ms before speaking")
 
-        return jsonify({
+        return jsonify({{
             "session_id": session_id, "reply": ai_reply,
             "phase": next_phase, "session_complete": session_complete,
             "extracted": merged,
@@ -805,11 +1259,11 @@ def therapy_session():
             "tone": tone,
             "pause_ms": pause_ms,
             "response_length": response_length,
-        })
+        }})
 
     except Exception as e:
         import traceback; print(traceback.format_exc())
-        return jsonify({"error": str(e)}), 500
+        return jsonify({{"error": str(e)}}), 500
 
 
 # ════════════════════════════════════════════════════════════
@@ -941,12 +1395,13 @@ def health():
             "Firebase-driven TTS config via config/tts_settings",
             "3-second ffmpeg-merged silence tail on all audio responses",
             "long responses by default (5-7 sentences, 1200 max_tokens)",
+            "voice test UI at /voice-test-ui",
         ]
     })
 
 
 # ════════════════════════════════════════════════════════════
-# ENDPOINT: /tts-config  — read & write TTS settings live
+# ENDPOINT: /tts-config
 # ════════════════════════════════════════════════════════════
 @app.route('/tts-config', methods=['GET', 'POST', 'OPTIONS'])
 def tts_config():
@@ -988,7 +1443,10 @@ def index():
         "tts": "Google Cloud TTS — Chirp HD-O (plain text)",
         "endpoints": {
             "/speak": "single-shot TTS (+ 3s silence tail)",
-            "/speak-stream": "sentence-chunked TTS — faster + more natural (+ 3s silence tail)",
+            "/speak-stream": "sentence-chunked TTS (+ 3s silence tail)",
+            "/speak-test": "raw voice tester — no fillers, voice override supported",
+            "/voice-test-ui": "browser UI for voice testing",
+            "/voices": "list all available voices",
             "/transcribe": "Whisper STT",
             "/therapy-session": "CBT session turn (long responses by default)",
             "/session-to-plan": "convert session to activity plan",
