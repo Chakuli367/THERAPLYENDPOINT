@@ -6,7 +6,8 @@ import requests as http_requests
 import re
 import base64
 from datetime import datetime
-from pydub import AudioSegment
+import subprocess
+import tempfile
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from openai import OpenAI
@@ -114,24 +115,110 @@ TTS_DEFAULTS = {
 # ── Silent MP3 padding helper ─────────────────────────────────
 SILENCE_PADDING_MS = 3000  # 3 seconds
 
+def _ffmpeg_available():
+    try:
+        subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=3)
+        return True
+    except Exception:
+        return False
+
+_HAS_FFMPEG = _ffmpeg_available()
+print(f"[silence] ffmpeg available: {_HAS_FFMPEG}")
+
+
 def append_silence(audio_bytes, silence_ms=SILENCE_PADDING_MS):
     """
-    Properly append silence to an MP3 using pydub so the combined file
-    is a single valid MP3 — no header/frame corruption.
-    Falls back to returning the original bytes if anything goes wrong.
+    Append silence to an MP3 by writing it via ffmpeg concat so the output
+    is a single valid MP3 file (no header/frame corruption).
+    Falls back to returning the original bytes unchanged if ffmpeg is absent.
     """
+    if not _HAS_FFMPEG:
+        print("[silence] ffmpeg not found — skipping silence padding")
+        return audio_bytes
+
     try:
-        seg = AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
-        silence = AudioSegment.silent(duration=silence_ms, frame_rate=seg.frame_rate)
-        combined = seg + silence
-        buf = io.BytesIO()
-        combined.export(buf, format="mp3", bitrate="128k")
-        result = buf.getvalue()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            speech_path  = os.path.join(tmpdir, "speech.mp3")
+            silence_path = os.path.join(tmpdir, "silence.mp3")
+            output_path  = os.path.join(tmpdir, "output.mp3")
+            list_path    = os.path.join(tmpdir, "concat.txt")
+
+            # Write the speech MP3
+            with open(speech_path, "wb") as f:
+                f.write(audio_bytes)
+
+            # Generate silence MP3 with ffmpeg
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-f", "lavfi",
+                "-i", f"anullsrc=r=24000:cl=mono",
+                "-t", str(silence_ms / 1000),
+                "-c:a", "libmp3lame", "-b:a", "128k", "-q:a", "4",
+                silence_path
+            ], capture_output=True, timeout=10, check=True)
+
+            # Concat list
+            with open(list_path, "w") as f:
+                f.write(f"file '{speech_path}'\nfile '{silence_path}'\n")
+
+            # Merge both into one MP3
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", list_path,
+                "-c", "copy",
+                output_path
+            ], capture_output=True, timeout=15, check=True)
+
+            with open(output_path, "rb") as f:
+                result = f.read()
+
         print(f"[silence] appended {silence_ms}ms — {len(audio_bytes)}b → {len(result)}b")
         return result
+
     except Exception as e:
-        print(f"[silence] pydub failed, returning original: {e}")
+        print(f"[silence] ffmpeg failed, returning original audio: {e}")
         return audio_bytes
+
+
+def merge_mp3s(chunks):
+    """
+    Merge a list of MP3 byte-strings into one valid MP3 using ffmpeg concat.
+    Falls back to raw concatenation if ffmpeg is absent (works for most players
+    when all chunks share the same bitrate/samplerate).
+    """
+    if len(chunks) == 1:
+        return chunks[0]
+
+    if not _HAS_FFMPEG:
+        return b"".join(chunks)
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            list_path   = os.path.join(tmpdir, "concat.txt")
+            output_path = os.path.join(tmpdir, "output.mp3")
+
+            with open(list_path, "w") as lf:
+                for i, chunk in enumerate(chunks):
+                    p = os.path.join(tmpdir, f"chunk_{i}.mp3")
+                    with open(p, "wb") as cf:
+                        cf.write(chunk)
+                    lf.write(f"file '{p}'\n")
+
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", list_path,
+                "-c", "copy",
+                output_path
+            ], capture_output=True, timeout=20, check=True)
+
+            with open(output_path, "rb") as f:
+                return f.read()
+
+    except Exception as e:
+        print(f"[merge_mp3s] ffmpeg failed, raw concat: {e}")
+        return b"".join(chunks)
 
 
 def get_tts_config():
@@ -474,7 +561,7 @@ def speak():
             return jsonify({"error": f"Google TTS error {response.status_code}: {response.text}"}), 503
 
         audio_bytes = base64.b64decode(response.json()["audioContent"])
-        # Append 3 seconds of proper silence using pydub so the MP3 stays valid.
+        # Append 3 seconds of proper silence using ffmpeg so the MP3 stays valid.
         padded_audio = append_silence(audio_bytes)
         print(f"[Google TTS] OK — padded to {len(padded_audio)} bytes total")
 
@@ -529,7 +616,7 @@ def speak_stream():
         print(f"[speak-stream] {len(sentences)} sentence(s) → voice: {cfg['voice']}")
 
         def generate():
-            # Collect all sentence audio first, then merge with silence via pydub
+            # Collect all sentence audio first, then merge with silence via ffmpeg
             # so the final MP3 is a single valid file (no frame corruption).
             chunks = []
             for i, sentence in enumerate(sentences):
@@ -546,17 +633,8 @@ def speak_stream():
             if len(chunks) == 1:
                 combined_bytes = chunks[0]
             else:
-                # Concatenate sentence MP3s properly with pydub
-                try:
-                    combined = AudioSegment.empty()
-                    for c in chunks:
-                        combined += AudioSegment.from_file(io.BytesIO(c), format="mp3")
-                    buf = io.BytesIO()
-                    combined.export(buf, format="mp3", bitrate="128k")
-                    combined_bytes = buf.getvalue()
-                except Exception as e:
-                    print(f"[speak-stream] pydub merge failed, concatenating raw: {e}")
-                    combined_bytes = b"".join(chunks)
+                # Concatenate sentence MP3s properly with ffmpeg
+                combined_bytes = merge_mp3s(chunks)
 
             # Append 3 seconds of proper silence
             final_bytes = append_silence(combined_bytes)
@@ -861,7 +939,7 @@ def health():
             "JSON safety net in /speak and /speak-stream",
             "digit-to-word conversion",
             "Firebase-driven TTS config via config/tts_settings",
-            "3-second pydub-merged silence tail on all audio responses",
+            "3-second ffmpeg-merged silence tail on all audio responses",
             "long responses by default (5-7 sentences, 1200 max_tokens)",
         ]
     })
