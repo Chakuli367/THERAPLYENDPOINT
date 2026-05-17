@@ -6,6 +6,7 @@ import requests as http_requests
 import re
 import base64
 from datetime import datetime
+from pydub import AudioSegment
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from openai import OpenAI
@@ -110,11 +111,27 @@ TTS_DEFAULTS = {
     "effects_profile":    "headphone-class-device",
 }
 
-# ── Silent MP3 padding (3 seconds) ───────────────────────────
-# MPEG1 Layer3 128kbps 44100Hz stereo silent frames
-# Frame size = 417 bytes, ~38.28 frames/sec → 115 frames ≈ 3.0 seconds
-_SILENT_MP3_FRAME = bytes([0xFF, 0xFB, 0x90, 0x64]) + bytes(417 - 4)
-SILENT_MP3_3S = _SILENT_MP3_FRAME * 115   # ~47 KB, appended to every audio response
+# ── Silent MP3 padding helper ─────────────────────────────────
+SILENCE_PADDING_MS = 3000  # 3 seconds
+
+def append_silence(audio_bytes, silence_ms=SILENCE_PADDING_MS):
+    """
+    Properly append silence to an MP3 using pydub so the combined file
+    is a single valid MP3 — no header/frame corruption.
+    Falls back to returning the original bytes if anything goes wrong.
+    """
+    try:
+        seg = AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
+        silence = AudioSegment.silent(duration=silence_ms, frame_rate=seg.frame_rate)
+        combined = seg + silence
+        buf = io.BytesIO()
+        combined.export(buf, format="mp3", bitrate="128k")
+        result = buf.getvalue()
+        print(f"[silence] appended {silence_ms}ms — {len(audio_bytes)}b → {len(result)}b")
+        return result
+    except Exception as e:
+        print(f"[silence] pydub failed, returning original: {e}")
+        return audio_bytes
 
 
 def get_tts_config():
@@ -457,10 +474,9 @@ def speak():
             return jsonify({"error": f"Google TTS error {response.status_code}: {response.text}"}), 503
 
         audio_bytes = base64.b64decode(response.json()["audioContent"])
-        # Append 3 seconds of silence so the AI has time to breathe and
-        # add inflection before the next turn begins.
-        padded_audio = audio_bytes + SILENT_MP3_3S
-        print(f"[Google TTS] OK — {len(audio_bytes)} bytes + {len(SILENT_MP3_3S)} bytes silence = {len(padded_audio)} total")
+        # Append 3 seconds of proper silence using pydub so the MP3 stays valid.
+        padded_audio = append_silence(audio_bytes)
+        print(f"[Google TTS] OK — padded to {len(padded_audio)} bytes total")
 
         return Response(
             padded_audio,
@@ -513,17 +529,39 @@ def speak_stream():
         print(f"[speak-stream] {len(sentences)} sentence(s) → voice: {cfg['voice']}")
 
         def generate():
+            # Collect all sentence audio first, then merge with silence via pydub
+            # so the final MP3 is a single valid file (no frame corruption).
+            chunks = []
             for i, sentence in enumerate(sentences):
                 if not sentence.strip():
                     continue
                 chunk = synthesize_sentence(sentence, cfg)
                 if chunk:
                     print(f"[speak-stream] chunk {i+1}/{len(sentences)}: {len(chunk)} bytes")
-                    yield chunk
-            # Append 3 seconds of silence at the end of the stream so the AI
-            # has time to settle before the next turn begins.
-            print(f"[speak-stream] appending {len(SILENT_MP3_3S)} bytes of silence (~3s)")
-            yield SILENT_MP3_3S
+                    chunks.append(chunk)
+
+            if not chunks:
+                return
+
+            if len(chunks) == 1:
+                combined_bytes = chunks[0]
+            else:
+                # Concatenate sentence MP3s properly with pydub
+                try:
+                    combined = AudioSegment.empty()
+                    for c in chunks:
+                        combined += AudioSegment.from_file(io.BytesIO(c), format="mp3")
+                    buf = io.BytesIO()
+                    combined.export(buf, format="mp3", bitrate="128k")
+                    combined_bytes = buf.getvalue()
+                except Exception as e:
+                    print(f"[speak-stream] pydub merge failed, concatenating raw: {e}")
+                    combined_bytes = b"".join(chunks)
+
+            # Append 3 seconds of proper silence
+            final_bytes = append_silence(combined_bytes)
+            print(f"[speak-stream] streaming {len(final_bytes)} bytes total (incl. 3s silence)")
+            yield final_bytes
 
         return Response(
             stream_with_context(generate()),
@@ -823,7 +861,7 @@ def health():
             "JSON safety net in /speak and /speak-stream",
             "digit-to-word conversion",
             "Firebase-driven TTS config via config/tts_settings",
-            "3-second silent MP3 tail on all audio responses",
+            "3-second pydub-merged silence tail on all audio responses",
             "long responses by default (5-7 sentences, 1200 max_tokens)",
         ]
     })
