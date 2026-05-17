@@ -53,12 +53,6 @@ db = firestore.client()
 
 # ── Bootstrap: create config/tts_settings if it doesn't exist ──
 def bootstrap_tts_config(max_retries=5, delay=2):
-    """
-    Creates the config/tts_settings Firestore document on first deploy.
-    Uses set(..., merge=True) so it never overwrites values you've already tuned.
-    Retries up to max_retries times with a delay between attempts.
-    Safe to call on every startup — skips if all fields already exist.
-    """
     defaults = {
         "voice":              "en-US-Chirp-HD-O",
         "speaking_rate":      1.0,
@@ -75,14 +69,13 @@ def bootstrap_tts_config(max_retries=5, delay=2):
         try:
             doc = ref.get()
             existing = doc.to_dict() if doc.exists else {}
-            # Only write fields that are genuinely missing
             missing = {k: v for k, v in defaults.items() if k not in existing}
             if missing:
                 ref.set(missing, merge=True)
                 print(f"[bootstrap] config/tts_settings created/patched: {list(missing.keys())}")
             else:
                 print("[bootstrap] config/tts_settings already complete — no changes needed")
-            return  # success
+            return
         except Exception as e:
             print(f"[bootstrap] Attempt {attempt}/{max_retries} failed: {e}")
             if attempt < max_retries:
@@ -105,26 +98,26 @@ if not GOOGLE_TTS_KEY:
 
 GOOGLE_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 
-# ── TTS config defaults (used if Firestore doc is missing or a field is absent) ──
+# ── TTS config defaults ───────────────────────────────────────
 TTS_DEFAULTS = {
     "voice":              "en-US-Chirp-HD-O",
-    "speaking_rate":      1.0,       # 0.25–4.0  (ignored for Chirp HD voices)
-    "pitch":              0.0,       # -20–20.0  (ignored for Chirp HD voices)
-    "volume_gain_db":     0.0,       # -96–16.0  (works on all voices)
+    "speaking_rate":      1.0,
+    "pitch":              0.0,
+    "volume_gain_db":     0.0,
     "filler_enabled":     True,
-    "filler_probability": 0.4,       # 0.0–1.0
+    "filler_probability": 0.4,
     "emotion_aware":      True,
     "effects_profile":    "headphone-class-device",
 }
 
+# ── Silent MP3 padding (3 seconds) ───────────────────────────
+# MPEG1 Layer3 128kbps 44100Hz stereo silent frames
+# Frame size = 417 bytes, ~38.28 frames/sec → 115 frames ≈ 3.0 seconds
+_SILENT_MP3_FRAME = bytes([0xFF, 0xFB, 0x90, 0x64]) + bytes(417 - 4)
+SILENT_MP3_3S = _SILENT_MP3_FRAME * 115   # ~47 KB, appended to every audio response
+
 
 def get_tts_config():
-    """
-    Read TTS settings from Firestore config/tts_settings on every call.
-    Falls back to TTS_DEFAULTS for any missing field.
-    Chirp HD voices don't support speakingRate or pitch — those keys are
-    silently dropped when the voice name contains 'Chirp-HD'.
-    """
     try:
         doc = db.collection("config").document("tts_settings").get()
         data = doc.to_dict() if doc.exists else {}
@@ -133,22 +126,14 @@ def get_tts_config():
         data = {}
 
     cfg = {**TTS_DEFAULTS, **{k: v for k, v in data.items() if k in TTS_DEFAULTS}}
-
-    # Validate ranges
     cfg["speaking_rate"]      = max(0.25, min(4.0,  float(cfg["speaking_rate"])))
     cfg["pitch"]              = max(-20.0, min(20.0, float(cfg["pitch"])))
     cfg["volume_gain_db"]     = max(-96.0, min(16.0, float(cfg["volume_gain_db"])))
     cfg["filler_probability"] = max(0.0,  min(1.0,  float(cfg["filler_probability"])))
-
     return cfg
 
 
 def build_audio_config(cfg):
-    """
-    Build the audioConfig dict for the Google TTS API call.
-    Chirp HD voices silently ignore speakingRate and pitch but don't error —
-    however some HD variants DO error, so we strip them to be safe.
-    """
     audio_cfg = {
         "audioEncoding": "MP3",
         "volumeGainDb":  cfg["volume_gain_db"],
@@ -182,7 +167,7 @@ RULES:
 - Always respond with VALID JSON only. No markdown. No preamble.
 - Move through phases 1 to 4. Never skip. Never go back.
 - Phase 4 always sets session_complete to true.
-- Keep your "message" to 2-3 SHORT sentences. You are speaking out loud, not writing.
+- Keep your "message" to 4-6 sentences. You are speaking out loud, not writing. Take your time.
 
 SPOKEN VOICE STYLE — CRITICAL:
 - Write for the EAR, not the eye. This is read aloud by a voice AI.
@@ -195,7 +180,12 @@ SPOKEN VOICE STYLE — CRITICAL:
 - NEVER use bullet points, lists, semicolons, colons, or parentheses.
 - NEVER use numbers as digits — write "five" not "5", "ten minutes" not "10 minutes".
 - BAD: "I understand that social situations can be quite challenging for you."
-- GOOD: "So that meeting's really getting to you. What's going through your head right now?"
+- GOOD: "So that meeting's really getting to you... I can hear it in what you're describing. What's the loudest thought going through your head right now?"
+
+RESPONSE LENGTH EXPECTATION:
+- Default to LONG, rich responses. Validate first. Then reflect. Then gently explore or reframe. Then close with a question.
+- Do NOT rush to the question — earn it by showing you've really heard them first.
+- Use natural pauses (...) to breathe between thoughts.
 
 PHASE GUIDE:
 Phase 1 (Understanding): Ask the user to describe what's making them anxious. Extract: situation, anxious_thought, emotion.
@@ -205,7 +195,7 @@ Phase 4 (Committing): Confirm the plan warmly. Set session_complete to true.
 
 RESPONSE FORMAT (always return this exact JSON):
 {
-  "message": "your spoken reply — short, warm, conversational, written for the ear",
+  "message": "your spoken reply — warm, unhurried, conversational, written for the ear",
   "phase": 1,
   "session_complete": false,
   "extracted": {
@@ -259,20 +249,6 @@ def parse_json_response(text):
 
 
 def detect_reply_tone(ai_reply):
-    """
-    Analyses the AI's own reply using VADER sentiment to decide how long the
-    frontend should pause before playing the audio — simulating a therapist
-    who takes a breath before delivering something heavy.
-
-    We analyse the AI reply (not the user message) because the AI knows what
-    it's about to say — empathetic/validating replies need more pre-speech space,
-    quick follow-up questions need less.
-
-    Returns (tone, pause_ms):
-      "heavy"  — compound ≤ -0.4  → 1600ms  (empathetic, validating, emotional)
-      "normal" — compound -0.4–0.1 → 900ms  (neutral, exploratory, Socratic)
-      "brief"  — compound > 0.1   →  400ms  (encouraging, confirming, upbeat)
-    """
     try:
         import nltk
         from nltk.sentiment.vader import SentimentIntensityAnalyzer
@@ -304,15 +280,6 @@ def split_into_sentences(text):
 
 
 def clean_sentence_for_tts(text):
-    """
-    Clean text for Chirp HD plain-text input.
-    - Strip markdown
-    - Convert ... to ". " — sentence boundary = longer natural pause
-    - Convert em-dash to ", "
-    - Write digits as words
-    No SSML, no speakingRate, no pitch (Chirp HD errors on these).
-    """
-    # Strip markdown
     text = re.sub(r'\*\*?(.*?)\*\*?', r'\1', text)
     text = re.sub(r'^\s*[-*]\s+', '', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
@@ -321,16 +288,13 @@ def clean_sentence_for_tts(text):
     text = re.sub(r'\n{2,}', ' ', text)
     text = re.sub(r'\n', ' ', text)
 
-    # Rhythm cues to natural punctuation
     text = text.replace('...', '. ')
-    text = text.replace('\u2014', ', ')  # em-dash
+    text = text.replace('\u2014', ', ')
     text = text.replace(' - ', ', ')
 
-    # Clean up double punctuation
     text = re.sub(r'\.\s*\.', '.', text)
     text = re.sub(r',\s*,', ',', text)
 
-    # Digits to words
     digit_map = [
         (r'\b1\b', 'one'), (r'\b2\b', 'two'), (r'\b3\b', 'three'),
         (r'\b4\b', 'four'), (r'\b5\b', 'five'), (r'\b6\b', 'six'),
@@ -346,7 +310,6 @@ def clean_sentence_for_tts(text):
 
 
 def clean_text_for_tts(text):
-    """Full message cleaner with JSON safety net."""
     try:
         maybe_json = json.loads(text)
         if isinstance(maybe_json, dict) and "message" in maybe_json:
@@ -358,11 +321,6 @@ def clean_text_for_tts(text):
 
 
 def add_thinking_filler(text, cfg=None):
-    """
-    Randomly prepend a warm thinking filler.
-    Probability and enabled flag come from Firebase config.
-    Skips if text already starts with a natural opener.
-    """
     if cfg is None:
         cfg = TTS_DEFAULTS
     if not cfg.get("filler_enabled", True):
@@ -377,10 +335,6 @@ def add_thinking_filler(text, cfg=None):
 
 
 def emotion_aware_preprocess(text, cfg=None):
-    """
-    Detect emotional weight and adjust pacing.
-    Controlled by emotion_aware flag in Firebase config.
-    """
     if cfg is None:
         cfg = TTS_DEFAULTS
     if not cfg.get("emotion_aware", True):
@@ -403,7 +357,7 @@ def emotion_aware_preprocess(text, cfg=None):
 
 
 def synthesize_sentence(sentence, cfg=None):
-    """Call Google TTS for a single sentence using live Firebase config. Returns MP3 bytes or None."""
+    """Call Google TTS for a single sentence. Returns MP3 bytes or None."""
     if cfg is None:
         cfg = TTS_DEFAULTS
     if not GOOGLE_TTS_KEY:
@@ -503,10 +457,13 @@ def speak():
             return jsonify({"error": f"Google TTS error {response.status_code}: {response.text}"}), 503
 
         audio_bytes = base64.b64decode(response.json()["audioContent"])
-        print(f"[Google TTS] OK — {len(audio_bytes)} bytes")
+        # Append 3 seconds of silence so the AI has time to breathe and
+        # add inflection before the next turn begins.
+        padded_audio = audio_bytes + SILENT_MP3_3S
+        print(f"[Google TTS] OK — {len(audio_bytes)} bytes + {len(SILENT_MP3_3S)} bytes silence = {len(padded_audio)} total")
 
         return Response(
-            audio_bytes,
+            padded_audio,
             mimetype="audio/mpeg",
             headers={"Content-Type": "audio/mpeg", "Access-Control-Allow-Origin": "*"}
         )
@@ -540,7 +497,6 @@ def speak_stream():
         if not GOOGLE_TTS_KEY:
             return jsonify({"error": "GOOGLE_TTS_KEY not configured"}), 500
 
-        # JSON safety net
         try:
             maybe_json = json.loads(text)
             if isinstance(maybe_json, dict) and "message" in maybe_json:
@@ -564,6 +520,10 @@ def speak_stream():
                 if chunk:
                     print(f"[speak-stream] chunk {i+1}/{len(sentences)}: {len(chunk)} bytes")
                     yield chunk
+            # Append 3 seconds of silence at the end of the stream so the AI
+            # has time to settle before the next turn begins.
+            print(f"[speak-stream] appending {len(SILENT_MP3_3S)} bytes of silence (~3s)")
+            yield SILENT_MP3_3S
 
         return Response(
             stream_with_context(generate()),
@@ -593,7 +553,8 @@ def therapy_session():
         user_message = data.get("message", "").strip()
         session_id = data.get("session_id")
         start_new = data.get("start_new", False)
-        response_length = data.get("response_length", "medium")  # "short" | "medium" | "long"
+        # Default changed to "long" so responses are richer out of the box
+        response_length = data.get("response_length", "long")  # "short" | "medium" | "long"
 
         if not user_id or not user_message:
             return jsonify({"error": "user_id and message required"}), 400
@@ -645,14 +606,16 @@ def therapy_session():
                 "Warm but concise."
             ),
             "long": (
-                "RESPONSE LENGTH: LONG — 4 to 6 sentences. This is what a real therapist sounds like. "
-                "Validate first, then reflect, then gently explore or reframe, then close with a question. "
-                "Take your time. Let the reply breathe. Use natural pauses (...) between thoughts. "
-                "Do NOT rush to the question — earn it by showing you've really heard them first."
+                "RESPONSE LENGTH: LONG — 5 to 7 sentences. This is what a real therapist sounds like. "
+                "Validate first, then reflect back what you heard in your own words, then gently explore "
+                "or reframe, then close with a question. Take your time. Let the reply breathe. "
+                "Use natural pauses (...) between thoughts. Do NOT rush to the question — earn it by "
+                "showing you've really heard them first. The person should feel truly seen."
             ),
-        }.get(response_length, "RESPONSE LENGTH: MEDIUM — 2 to 3 sentences.")
+        }.get(response_length, "RESPONSE LENGTH: LONG — 5 to 7 sentences.")
 
-        length_tokens = {"short": 200, "medium": 400, "long": 800}.get(response_length, 400)
+        # Increased max_tokens for long responses to give the model room to breathe
+        length_tokens = {"short": 200, "medium": 400, "long": 1200}.get(response_length, 1200)
 
         phase_reminder = {
             "role": "system",
@@ -660,7 +623,8 @@ def therapy_session():
                 f"CURRENT PHASE: {current_phase}\n"
                 f"EXTRACTED SO FAR: {json.dumps(extracted_so_far)}\n"
                 f"{length_guide}\n"
-                "Respond with valid JSON only. Write the message for the EAR — warm, conversational, max 12 words per sentence."
+                "Respond with valid JSON only. Write the message for the EAR — warm, unhurried, "
+                "conversational. Use short sentences and natural pauses (...)."
             )
         }
         messages_for_model = [messages[0], phase_reminder] + messages[1:]
@@ -859,6 +823,8 @@ def health():
             "JSON safety net in /speak and /speak-stream",
             "digit-to-word conversion",
             "Firebase-driven TTS config via config/tts_settings",
+            "3-second silent MP3 tail on all audio responses",
+            "long responses by default (5-7 sentences, 1200 max_tokens)",
         ]
     })
 
@@ -875,11 +841,9 @@ def tts_config():
         cfg = get_tts_config()
         return jsonify({"success": True, "config": cfg})
 
-    # POST — update one or more fields
     try:
         updates = request.get_json() or {}
 
-        # Special action: retry bootstrap
         if updates.get("action") == "reset_defaults":
             db.collection("config").document("tts_settings").delete()
             bootstrap_tts_config()
@@ -907,10 +871,10 @@ def index():
         "status": "Voice therapy backend running",
         "tts": "Google Cloud TTS — Chirp HD-O (plain text)",
         "endpoints": {
-            "/speak": "single-shot TTS",
-            "/speak-stream": "sentence-chunked TTS — faster + more natural",
+            "/speak": "single-shot TTS (+ 3s silence tail)",
+            "/speak-stream": "sentence-chunked TTS — faster + more natural (+ 3s silence tail)",
             "/transcribe": "Whisper STT",
-            "/therapy-session": "CBT session turn",
+            "/therapy-session": "CBT session turn (long responses by default)",
             "/session-to-plan": "convert session to activity plan",
             "/therapy-session/history": "list past sessions",
         }
