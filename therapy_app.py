@@ -21,45 +21,45 @@ CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False)
 # ── CORS: handle ALL OPTIONS preflights globally ─────────────
 @app.before_request
 def handle_options():
-if request.method == 'OPTIONS':
-res = Response()
-res.headers['Access-Control-Allow-Origin'] = '*'
-res.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
-res.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
-res.headers['Access-Control-Max-Age'] = '3600'
-res.status_code = 200
-return res
+    if request.method == 'OPTIONS':
+        res = Response()
+        res.headers['Access-Control-Allow-Origin'] = '*'
+        res.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        res.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
+        res.headers['Access-Control-Max-Age'] = '3600'
+        res.status_code = 200
+        return res
 
 @app.after_request
 def add_cors_headers(response):
-response.headers['Access-Control-Allow-Origin'] = '*'
-response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
-response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
-response.headers['Access-Control-Max-Age'] = '3600'
-return response
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
+    response.headers['Access-Control-Max-Age'] = '3600'
+    return response
 
 # ── Firebase ─────────────────────────────────────────────────
 firebase_config_json = os.environ.get("FIREBASE_CONFIG")
 if not firebase_config_json:
-raise EnvironmentError("FIREBASE_CONFIG environment variable not set")
+    raise EnvironmentError("FIREBASE_CONFIG environment variable not set")
 
 firebase_json = json.loads(firebase_config_json)
 if not firebase_admin._apps:
-cred = credentials.Certificate(firebase_json)
-initialize_app(cred)
+    cred = credentials.Certificate(firebase_json)
+    initialize_app(cred)
 
 db = firestore.client()
 
 # ── Groq client ──────────────────────────────────────────────
 client = OpenAI(
-api_key=os.environ.get("GROQ_API_KEY"),
-base_url="https://api.groq.com/openai/v1"
+    api_key=os.environ.get("GROQ_API_KEY"),
+    base_url="https://api.groq.com/openai/v1"
 )
 
 # ── Google Cloud TTS ─────────────────────────────────────────
 GOOGLE_TTS_KEY = os.environ.get("GOOGLE_TTS_KEY")
 if not GOOGLE_TTS_KEY:
-print("Warning: GOOGLE_TTS_KEY not set — /speak will fail")
+    print("Warning: GOOGLE_TTS_KEY not set — /speak will fail")
 
 GOOGLE_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 
@@ -69,15 +69,14 @@ GOOGLE_TTS_URL = "https://texttospeech.googleapis.com/v1/text:synthesize"
 GOOGLE_TTS_VOICE = "en-US-Chirp-HD-O"
 
 # ── Thinking fillers ──────────────────────────────────────────
-# Prepended randomly 40% of the time to feel less instant.
 THINKING_FILLERS = [
-"Mmm.",
-"Yeah.",
-"Right.",
-"Okay.",
-"Got it.",
-"Mmm, okay.",
-"Yeah, okay.",
+    "Mmm.",
+    "Yeah.",
+    "Right.",
+    "Okay.",
+    "Got it.",
+    "Mmm, okay.",
+    "Yeah, okay.",
 ]
 
 # ── Prompts ───────────────────────────────────────────────────
@@ -110,22 +109,22 @@ Phase 4 (Committing): Confirm the plan warmly. Set session_complete to true.
 
 RESPONSE FORMAT (always return this exact JSON):
 {
-"message": "your spoken reply — short, warm, conversational, written for the ear",
-"phase": 1,
-"session_complete": false,
-"extracted": {
-"situation": "",
-"anxious_thought": "",
-"emotion": "",
-"reframe": "",
-"proposed_task": {
-"name": "",
-"type": "",
-"why": "",
-"anxiety_pre": 5,
-"action_steps": []
-}
-}
+  "message": "your spoken reply — short, warm, conversational, written for the ear",
+  "phase": 1,
+  "session_complete": false,
+  "extracted": {
+    "situation": "",
+    "anxious_thought": "",
+    "emotion": "",
+    "reframe": "",
+    "proposed_task": {
+      "name": "",
+      "type": "",
+      "why": "",
+      "anxiety_pre": 5,
+      "action_steps": []
+    }
+  }
 }"""
 
 SESSION_TO_PLAN_PROMPT = """You are converting a completed therapy session into a structured activity plan.
@@ -135,14 +134,14 @@ SESSION SUMMARY:
 
 Convert this into a JSON activity object with this EXACT structure:
 {{
-"name": "<task name from session>",
-"type": "<one of: Social Event, Medical Appointment, Work/School, Public Place (Gym, Store), Phone Call, Other>",
-"why": "<the reason the user committed to this>",
-"preAnxiety": <anxiety_pre number from session, default 5>,
-"scheduledDate": <timestamp ms, 24 hours from now>,
-"actionSteps": [{{"text": "<step>"}}, {{"text": "<step>"}}],
-"sessionInsight": "<the CBT reframe, one sentence>",
-"source": "therapy_session"
+  "name": "<task name from session>",
+  "type": "<one of: Social Event, Medical Appointment, Work/School, Public Place (Gym, Store), Phone Call, Other>",
+  "why": "<the reason the user committed to this>",
+  "preAnxiety": <anxiety_pre number from session, default 5>,
+  "scheduledDate": <timestamp ms, 24 hours from now>,
+  "actionSteps": [{{"text": "<step>"}}, {{"text": "<step>"}}],
+  "sessionInsight": "<the CBT reframe, one sentence>",
+  "source": "therapy_session"
 }}
 
 Return ONLY the JSON. No markdown. No explanation."""
@@ -153,135 +152,135 @@ Return ONLY the JSON. No markdown. No explanation."""
 # ════════════════════════════════════════════════════════════
 
 def parse_json_response(text):
-try:
-if "```json" in text:
-text = text.split("```json")[1].split("```")[0].strip()
-elif "```" in text:
-text = text.split("```")[1].split("```")[0].strip()
-return json.loads(text)
-except Exception:
-return None
+    try:
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0].strip()
+        return json.loads(text)
+    except Exception:
+        return None
 
 
 def split_into_sentences(text):
-parts = re.split(r'(?<=[.!?])\s+', text.strip())
-return [p.strip() for p in parts if p.strip()]
+    parts = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [p.strip() for p in parts if p.strip()]
 
 
 def clean_sentence_for_tts(text):
-"""
-Clean text for Chirp HD plain-text input.
-- Strip markdown
-- Convert ... to ". " — sentence boundary = longer natural pause
-- Convert em-dash to ", "
-- Write digits as words
-No SSML, no speakingRate, no pitch (Chirp HD errors on these).
-"""
-# Strip markdown
-text = re.sub(r'\*\*?(.*?)\*\*?', r'\1', text)
-text = re.sub(r'^\s*[-*]\s+', '', text, flags=re.MULTILINE)
-text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
-text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)
-text = re.sub(r'\[.*?\]|\(.*?\)', '', text)
-text = re.sub(r'\n{2,}', ' ', text)
-text = re.sub(r'\n', ' ', text)
+    """
+    Clean text for Chirp HD plain-text input.
+    - Strip markdown
+    - Convert ... to ". " — sentence boundary = longer natural pause
+    - Convert em-dash to ", "
+    - Write digits as words
+    No SSML, no speakingRate, no pitch (Chirp HD errors on these).
+    """
+    # Strip markdown
+    text = re.sub(r'\*\*?(.*?)\*\*?', r'\1', text)
+    text = re.sub(r'^\s*[-*]\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'\[.*?\]|\(.*?\)', '', text)
+    text = re.sub(r'\n{2,}', ' ', text)
+    text = re.sub(r'\n', ' ', text)
 
-# Rhythm cues to natural punctuation
-text = text.replace('...', '. ')
-text = text.replace('\u2014', ', ') # em-dash
-text = text.replace(' - ', ', ')
+    # Rhythm cues to natural punctuation
+    text = text.replace('...', '. ')
+    text = text.replace('\u2014', ', ')  # em-dash
+    text = text.replace(' - ', ', ')
 
-# Clean up double punctuation
-text = re.sub(r'\.\s*\.', '.', text)
-text = re.sub(r',\s*,', ',', text)
+    # Clean up double punctuation
+    text = re.sub(r'\.\s*\.', '.', text)
+    text = re.sub(r',\s*,', ',', text)
 
-# Digits to words
-digit_map = [
-(r'\b1\b', 'one'), (r'\b2\b', 'two'), (r'\b3\b', 'three'),
-(r'\b4\b', 'four'), (r'\b5\b', 'five'), (r'\b6\b', 'six'),
-(r'\b7\b', 'seven'), (r'\b8\b', 'eight'), (r'\b9\b', 'nine'),
-(r'\b10\b', 'ten'), (r'\b15\b', 'fifteen'), (r'\b20\b', 'twenty'),
-(r'\b30\b', 'thirty'),
-]
-for pattern, word in digit_map:
-text = re.sub(pattern, word, text)
+    # Digits to words
+    digit_map = [
+        (r'\b1\b', 'one'), (r'\b2\b', 'two'), (r'\b3\b', 'three'),
+        (r'\b4\b', 'four'), (r'\b5\b', 'five'), (r'\b6\b', 'six'),
+        (r'\b7\b', 'seven'), (r'\b8\b', 'eight'), (r'\b9\b', 'nine'),
+        (r'\b10\b', 'ten'), (r'\b15\b', 'fifteen'), (r'\b20\b', 'twenty'),
+        (r'\b30\b', 'thirty'),
+    ]
+    for pattern, word in digit_map:
+        text = re.sub(pattern, word, text)
 
-text = re.sub(r'\s{2,}', ' ', text).strip()
-return text
+    text = re.sub(r'\s{2,}', ' ', text).strip()
+    return text
 
 
 def clean_text_for_tts(text):
-"""Full message cleaner with JSON safety net."""
-try:
-maybe_json = json.loads(text)
-if isinstance(maybe_json, dict) and "message" in maybe_json:
-text = maybe_json["message"]
-print("[/speak] Full JSON received — extracted 'message' field automatically")
-except (json.JSONDecodeError, TypeError):
-pass
-return clean_sentence_for_tts(text)
+    """Full message cleaner with JSON safety net."""
+    try:
+        maybe_json = json.loads(text)
+        if isinstance(maybe_json, dict) and "message" in maybe_json:
+            text = maybe_json["message"]
+            print("[/speak] Full JSON received — extracted 'message' field automatically")
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return clean_sentence_for_tts(text)
 
 
 def add_thinking_filler(text):
-"""
-Randomly prepend a warm thinking filler 40% of the time.
-Skips if text already starts with a natural opener.
-"""
-filler_starts = ('mmm', 'yeah', 'right', 'okay', 'got it', 'so ', 'and ')
-if text.lower().startswith(filler_starts):
-return text
-if random.random() < 0.40:
-filler = random.choice(THINKING_FILLERS)
-return f"{filler} {text}"
-return text
+    """
+    Randomly prepend a warm thinking filler 40% of the time.
+    Skips if text already starts with a natural opener.
+    """
+    filler_starts = ('mmm', 'yeah', 'right', 'okay', 'got it', 'so ', 'and ')
+    if text.lower().startswith(filler_starts):
+        return text
+    if random.random() < 0.40:
+        filler = random.choice(THINKING_FILLERS)
+        return f"{filler} {text}"
+    return text
 
 
 def emotion_aware_preprocess(text):
-"""
-Detect emotional weight and adjust pacing.
-Heavy statements get a natural pause inserted after the first sentence.
-Pure text logic — no extra API calls.
-"""
-heavy_keywords = [
-'scared', 'terrified', 'alone', 'hopeless', 'worthless',
-'failure', 'hate myself', 'awful', 'devastated', 'breakdown',
-'panic', 'crying', 'ashamed', 'embarrassed', 'humiliated'
-]
-is_heavy = any(kw in text.lower() for kw in heavy_keywords)
+    """
+    Detect emotional weight and adjust pacing.
+    Heavy statements get a natural pause inserted after the first sentence.
+    Pure text logic — no extra API calls.
+    """
+    heavy_keywords = [
+        'scared', 'terrified', 'alone', 'hopeless', 'worthless',
+        'failure', 'hate myself', 'awful', 'devastated', 'breakdown',
+        'panic', 'crying', 'ashamed', 'embarrassed', 'humiliated'
+    ]
+    is_heavy = any(kw in text.lower() for kw in heavy_keywords)
 
-if is_heavy:
-sentences = split_into_sentences(text)
-if len(sentences) >= 2:
-sentences[0] = sentences[0].rstrip('.!?') + '.'
-return sentences[0] + ' ' + ' '.join(sentences[1:])
+    if is_heavy:
+        sentences = split_into_sentences(text)
+        if len(sentences) >= 2:
+            sentences[0] = sentences[0].rstrip('.!?') + '.'
+            return sentences[0] + ' ' + ' '.join(sentences[1:])
 
-return text
+    return text
 
 
 def synthesize_sentence(sentence):
-"""Call Google TTS for a single sentence. Returns MP3 bytes or None."""
-if not GOOGLE_TTS_KEY:
-return None
-try:
-resp = http_requests.post(
-f"{GOOGLE_TTS_URL}?key={GOOGLE_TTS_KEY}",
-json={
-"input": {"text": sentence},
-"voice": {"languageCode": "en-US", "name": GOOGLE_TTS_VOICE},
-"audioConfig": {
-"audioEncoding": "MP3",
-"effectsProfileId": ["headphone-class-device"],
-}
-},
-timeout=15
-)
-if resp.status_code == 200:
-return base64.b64decode(resp.json()["audioContent"])
-print(f"[TTS] error {resp.status_code}: {resp.text[:200]}")
-return None
-except Exception as e:
-print(f"[TTS] exception: {e}")
-return None
+    """Call Google TTS for a single sentence. Returns MP3 bytes or None."""
+    if not GOOGLE_TTS_KEY:
+        return None
+    try:
+        resp = http_requests.post(
+            f"{GOOGLE_TTS_URL}?key={GOOGLE_TTS_KEY}",
+            json={
+                "input": {"text": sentence},
+                "voice": {"languageCode": "en-US", "name": GOOGLE_TTS_VOICE},
+                "audioConfig": {
+                    "audioEncoding": "MP3",
+                    "effectsProfileId": ["headphone-class-device"],
+                }
+            },
+            timeout=15
+        )
+        if resp.status_code == 200:
+            return base64.b64decode(resp.json()["audioContent"])
+        print(f"[TTS] error {resp.status_code}: {resp.text[:200]}")
+        return None
+    except Exception as e:
+        print(f"[TTS] exception: {e}")
+        return None
 
 
 # ════════════════════════════════════════════════════════════
@@ -289,31 +288,31 @@ return None
 # ════════════════════════════════════════════════════════════
 @app.route('/transcribe', methods=['POST', 'OPTIONS'])
 def transcribe():
-if request.method == 'OPTIONS':
-return '', 204
-try:
-if 'audio' not in request.files:
-return jsonify({"error": "No audio file provided"}), 400
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        if 'audio' not in request.files:
+            return jsonify({"error": "No audio file provided"}), 400
 
-audio_bytes = request.files['audio'].read()
-audio_name = request.files['audio'].filename or 'audio.webm'
+        audio_bytes = request.files['audio'].read()
+        audio_name = request.files['audio'].filename or 'audio.webm'
 
-if 'mp4' in audio_name:
-mime = 'audio/mp4'
-elif 'ogg' in audio_name:
-mime = 'audio/ogg'
-else:
-mime = 'audio/webm'
+        if 'mp4' in audio_name:
+            mime = 'audio/mp4'
+        elif 'ogg' in audio_name:
+            mime = 'audio/ogg'
+        else:
+            mime = 'audio/webm'
 
-transcript = client.audio.transcriptions.create(
-model="whisper-large-v3-turbo",
-file=(audio_name, io.BytesIO(audio_bytes), mime),
-)
-return jsonify({"success": True, "transcript": transcript.text.strip()})
+        transcript = client.audio.transcriptions.create(
+            model="whisper-large-v3-turbo",
+            file=(audio_name, io.BytesIO(audio_bytes), mime),
+        )
+        return jsonify({"success": True, "transcript": transcript.text.strip()})
 
-except Exception as e:
-import traceback; print(traceback.format_exc())
-return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        import traceback; print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
 
 
 # ════════════════════════════════════════════════════════════
@@ -321,125 +320,121 @@ return jsonify({"error": str(e)}), 500
 # ════════════════════════════════════════════════════════════
 @app.route('/speak', methods=['POST', 'OPTIONS'])
 def speak():
-if request.method == 'OPTIONS':
-res = Response()
-res.headers['Access-Control-Allow-Origin'] = '*'
-res.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-res.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-res.headers['Access-Control-Max-Age'] = '3600'
-res.status_code = 200
-return res
+    if request.method == 'OPTIONS':
+        res = Response()
+        res.headers['Access-Control-Allow-Origin'] = '*'
+        res.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        res.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        res.headers['Access-Control-Max-Age'] = '3600'
+        res.status_code = 200
+        return res
 
-try:
-data = request.get_json()
-text = data.get("text", "").strip()
-if not text:
-return jsonify({"error": "No text provided"}), 400
-if not GOOGLE_TTS_KEY:
-return jsonify({"error": "GOOGLE_TTS_KEY not configured"}), 500
+    try:
+        data = request.get_json()
+        text = data.get("text", "").strip()
+        if not text:
+            return jsonify({"error": "No text provided"}), 400
+        if not GOOGLE_TTS_KEY:
+            return jsonify({"error": "GOOGLE_TTS_KEY not configured"}), 500
 
-clean = clean_text_for_tts(text)
-filled = add_thinking_filler(clean)
-final = emotion_aware_preprocess(filled)
+        clean = clean_text_for_tts(text)
+        filled = add_thinking_filler(clean)
+        final = emotion_aware_preprocess(filled)
 
-print(f"[Google TTS] Voice: {GOOGLE_TTS_VOICE} | Text: {final[:120]}")
+        print(f"[Google TTS] Voice: {GOOGLE_TTS_VOICE} | Text: {final[:120]}")
 
-response = http_requests.post(
-f"{GOOGLE_TTS_URL}?key={GOOGLE_TTS_KEY}",
-json={
-"input": {"text": final},
-"voice": {"languageCode": "en-US", "name": GOOGLE_TTS_VOICE},
-"audioConfig": {
-"audioEncoding": "MP3",
-"effectsProfileId": ["headphone-class-device"],
-}
-},
-timeout=30
-)
+        response = http_requests.post(
+            f"{GOOGLE_TTS_URL}?key={GOOGLE_TTS_KEY}",
+            json={
+                "input": {"text": final},
+                "voice": {"languageCode": "en-US", "name": GOOGLE_TTS_VOICE},
+                "audioConfig": {
+                    "audioEncoding": "MP3",
+                    "effectsProfileId": ["headphone-class-device"],
+                }
+            },
+            timeout=30
+        )
 
-if response.status_code != 200:
-print(f"[Google TTS] Error {response.status_code}: {response.text}")
-return jsonify({"error": f"Google TTS error {response.status_code}: {response.text}"}), 503
+        if response.status_code != 200:
+            print(f"[Google TTS] Error {response.status_code}: {response.text}")
+            return jsonify({"error": f"Google TTS error {response.status_code}: {response.text}"}), 503
 
-audio_bytes = base64.b64decode(response.json()["audioContent"])
-print(f"[Google TTS] OK — {len(audio_bytes)} bytes")
+        audio_bytes = base64.b64decode(response.json()["audioContent"])
+        print(f"[Google TTS] OK — {len(audio_bytes)} bytes")
 
-return Response(
-audio_bytes,
-mimetype="audio/mpeg",
-headers={"Content-Type": "audio/mpeg", "Access-Control-Allow-Origin": "*"}
-)
+        return Response(
+            audio_bytes,
+            mimetype="audio/mpeg",
+            headers={"Content-Type": "audio/mpeg", "Access-Control-Allow-Origin": "*"}
+        )
 
-except http_requests.exceptions.Timeout:
-return jsonify({"error": "Google TTS request timed out"}), 503
-except Exception as e:
-import traceback; print(traceback.format_exc())
-return jsonify({"error": str(e)}), 500
+    except http_requests.exceptions.Timeout:
+        return jsonify({"error": "Google TTS request timed out"}), 503
+    except Exception as e:
+        import traceback; print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
 
 
 # ════════════════════════════════════════════════════════════
 # ENDPOINT: /speak-stream
-# Sentence-chunked TTS — splits reply sentence by sentence,
-# synthesizes each and streams them back concatenated.
-# First audio arrives ~600ms faster than full-message /speak.
-# Use this as a drop-in for /speak on the frontend.
 # ════════════════════════════════════════════════════════════
 @app.route('/speak-stream', methods=['POST', 'OPTIONS'])
 def speak_stream():
-if request.method == 'OPTIONS':
-res = Response()
-res.headers['Access-Control-Allow-Origin'] = '*'
-res.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-res.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-res.headers['Access-Control-Max-Age'] = '3600'
-res.status_code = 200
-return res
+    if request.method == 'OPTIONS':
+        res = Response()
+        res.headers['Access-Control-Allow-Origin'] = '*'
+        res.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        res.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        res.headers['Access-Control-Max-Age'] = '3600'
+        res.status_code = 200
+        return res
 
-try:
-data = request.get_json()
-text = data.get("text", "").strip()
-if not text:
-return jsonify({"error": "No text provided"}), 400
-if not GOOGLE_TTS_KEY:
-return jsonify({"error": "GOOGLE_TTS_KEY not configured"}), 500
+    try:
+        data = request.get_json()
+        text = data.get("text", "").strip()
+        if not text:
+            return jsonify({"error": "No text provided"}), 400
+        if not GOOGLE_TTS_KEY:
+            return jsonify({"error": "GOOGLE_TTS_KEY not configured"}), 500
 
-# JSON safety net
-try:
-maybe_json = json.loads(text)
-if isinstance(maybe_json, dict) and "message" in maybe_json:
-text = maybe_json["message"]
-except (json.JSONDecodeError, TypeError):
-pass
+        # JSON safety net
+        try:
+            maybe_json = json.loads(text)
+            if isinstance(maybe_json, dict) and "message" in maybe_json:
+                text = maybe_json["message"]
+        except (json.JSONDecodeError, TypeError):
+            pass
 
-clean = clean_sentence_for_tts(text)
-filled = add_thinking_filler(clean)
-final = emotion_aware_preprocess(filled)
-sentences = split_into_sentences(final) or [final]
+        clean = clean_sentence_for_tts(text)
+        filled = add_thinking_filler(clean)
+        final = emotion_aware_preprocess(filled)
+        sentences = split_into_sentences(final) or [final]
 
-print(f"[speak-stream] {len(sentences)} sentence(s) → Chirp HD")
+        print(f"[speak-stream] {len(sentences)} sentence(s) → Chirp HD")
 
-def generate():
-for i, sentence in enumerate(sentences):
-if not sentence.strip():
-continue
-chunk = synthesize_sentence(sentence)
-if chunk:
-print(f"[speak-stream] chunk {i+1}/{len(sentences)}: {len(chunk)} bytes")
-yield chunk
+        def generate():
+            for i, sentence in enumerate(sentences):
+                if not sentence.strip():
+                    continue
+                chunk = synthesize_sentence(sentence)
+                if chunk:
+                    print(f"[speak-stream] chunk {i+1}/{len(sentences)}: {len(chunk)} bytes")
+                    yield chunk
 
-return Response(
-stream_with_context(generate()),
-mimetype="audio/mpeg",
-headers={
-"Content-Type": "audio/mpeg",
-"Access-Control-Allow-Origin": "*",
-"X-Accel-Buffering": "no",
-}
-)
+        return Response(
+            stream_with_context(generate()),
+            mimetype="audio/mpeg",
+            headers={
+                "Content-Type": "audio/mpeg",
+                "Access-Control-Allow-Origin": "*",
+                "X-Accel-Buffering": "no",
+            }
+        )
 
-except Exception as e:
-import traceback; print(traceback.format_exc())
-return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        import traceback; print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
 
 
 # ════════════════════════════════════════════════════════════
@@ -447,124 +442,124 @@ return jsonify({"error": str(e)}), 500
 # ════════════════════════════════════════════════════════════
 @app.route('/therapy-session', methods=['POST', 'OPTIONS'])
 def therapy_session():
-if request.method == 'OPTIONS':
-return '', 204
-try:
-data = request.get_json()
-user_id = data.get("user_id")
-user_message = data.get("message", "").strip()
-session_id = data.get("session_id")
-start_new = data.get("start_new", False)
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        data = request.get_json()
+        user_id = data.get("user_id")
+        user_message = data.get("message", "").strip()
+        session_id = data.get("session_id")
+        start_new = data.get("start_new", False)
 
-if not user_id or not user_message:
-return jsonify({"error": "user_id and message required"}), 400
+        if not user_id or not user_message:
+            return jsonify({"error": "user_id and message required"}), 400
 
-if not session_id or start_new:
-session_id = f"therapy_{user_id}_{int(datetime.now().timestamp())}"
-session_data = {
-"session_id": session_id, "user_id": user_id,
-"messages": [], "phase": 1,
-"extracted": {
-"situation": "", "anxious_thought": "", "emotion": "", "reframe": "",
-"proposed_task": {"name": "", "type": "", "why": "", "anxiety_pre": 5, "action_steps": []}
-},
-"session_complete": False,
-"created_at": datetime.utcnow().isoformat()
-}
-db.collection("users").document(user_id) \
-.collection("therapy_sessions").document(session_id).set(session_data)
-else:
-doc = db.collection("users").document(user_id) \
-.collection("therapy_sessions").document(session_id).get()
-if not doc.exists:
-return jsonify({"error": "Session not found. Pass start_new: true."}), 404
-session_data = doc.to_dict()
+        if not session_id or start_new:
+            session_id = f"therapy_{user_id}_{int(datetime.now().timestamp())}"
+            session_data = {
+                "session_id": session_id, "user_id": user_id,
+                "messages": [], "phase": 1,
+                "extracted": {
+                    "situation": "", "anxious_thought": "", "emotion": "", "reframe": "",
+                    "proposed_task": {"name": "", "type": "", "why": "", "anxiety_pre": 5, "action_steps": []}
+                },
+                "session_complete": False,
+                "created_at": datetime.utcnow().isoformat()
+            }
+            db.collection("users").document(user_id) \
+              .collection("therapy_sessions").document(session_id).set(session_data)
+        else:
+            doc = db.collection("users").document(user_id) \
+                    .collection("therapy_sessions").document(session_id).get()
+            if not doc.exists:
+                return jsonify({"error": "Session not found. Pass start_new: true."}), 404
+            session_data = doc.to_dict()
 
-if session_data.get("session_complete"):
-return jsonify({
-"session_id": session_id, "reply": "This session is complete.",
-"phase": 5, "session_complete": True,
-"extracted": session_data.get("extracted", {})
-})
+        if session_data.get("session_complete"):
+            return jsonify({
+                "session_id": session_id, "reply": "This session is complete.",
+                "phase": 5, "session_complete": True,
+                "extracted": session_data.get("extracted", {})
+            })
 
-messages = session_data.get("messages", [])
-if len(messages) == 0:
-messages = [{"role": "system", "content": THERAPY_SYSTEM_PROMPT}]
+        messages = session_data.get("messages", [])
+        if len(messages) == 0:
+            messages = [{"role": "system", "content": THERAPY_SYSTEM_PROMPT}]
 
-messages.append({"role": "user", "content": user_message})
+        messages.append({"role": "user", "content": user_message})
 
-current_phase = session_data.get("phase", 1)
-extracted_so_far = session_data.get("extracted", {})
+        current_phase = session_data.get("phase", 1)
+        extracted_so_far = session_data.get("extracted", {})
 
-phase_reminder = {
-"role": "system",
-"content": (
-f"CURRENT PHASE: {current_phase}\n"
-f"EXTRACTED SO FAR: {json.dumps(extracted_so_far)}\n"
-"Respond with valid JSON only. Write the message for the EAR — short, warm, max 12 words per sentence."
-)
-}
-messages_for_model = [messages[0], phase_reminder] + messages[1:]
+        phase_reminder = {
+            "role": "system",
+            "content": (
+                f"CURRENT PHASE: {current_phase}\n"
+                f"EXTRACTED SO FAR: {json.dumps(extracted_so_far)}\n"
+                "Respond with valid JSON only. Write the message for the EAR — short, warm, max 12 words per sentence."
+            )
+        }
+        messages_for_model = [messages[0], phase_reminder] + messages[1:]
 
-response = client.chat.completions.create(
-model="llama-3.3-70b-versatile",
-messages=messages_for_model,
-temperature=0.65,
-max_tokens=600
-)
-raw_reply = response.choices[0].message.content.strip()
-parsed = parse_json_response(raw_reply)
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages_for_model,
+            temperature=0.65,
+            max_tokens=600
+        )
+        raw_reply = response.choices[0].message.content.strip()
+        parsed = parse_json_response(raw_reply)
 
-if not parsed:
-messages.append({"role": "assistant", "content": raw_reply})
-db.collection("users").document(user_id) \
-.collection("therapy_sessions").document(session_id) \
-.update({"messages": messages})
-return jsonify({
-"session_id": session_id, "reply": raw_reply,
-"phase": current_phase, "session_complete": False
-})
+        if not parsed:
+            messages.append({"role": "assistant", "content": raw_reply})
+            db.collection("users").document(user_id) \
+              .collection("therapy_sessions").document(session_id) \
+              .update({"messages": messages})
+            return jsonify({
+                "session_id": session_id, "reply": raw_reply,
+                "phase": current_phase, "session_complete": False
+            })
 
-ai_reply = parsed.get("message", raw_reply)
-next_phase = parsed.get("phase", current_phase)
-session_complete = parsed.get("session_complete", False)
-new_extracted = parsed.get("extracted", {})
+        ai_reply = parsed.get("message", raw_reply)
+        next_phase = parsed.get("phase", current_phase)
+        session_complete = parsed.get("session_complete", False)
+        new_extracted = parsed.get("extracted", {})
 
-merged = session_data.get("extracted", {})
-for key, val in new_extracted.items():
-if isinstance(val, dict):
-if key not in merged:
-merged[key] = {}
-for subkey, subval in val.items():
-if subval and subval != "" and subval != 0:
-merged[key][subkey] = subval
-else:
-if val and val != "" and val != 0:
-merged[key] = val
+        merged = session_data.get("extracted", {})
+        for key, val in new_extracted.items():
+            if isinstance(val, dict):
+                if key not in merged:
+                    merged[key] = {}
+                for subkey, subval in val.items():
+                    if subval and subval != "" and subval != 0:
+                        merged[key][subkey] = subval
+            else:
+                if val and val != "" and val != 0:
+                    merged[key] = val
 
-messages.append({"role": "assistant", "content": ai_reply})
+        messages.append({"role": "assistant", "content": ai_reply})
 
-update_payload = {
-"messages": messages, "phase": next_phase,
-"extracted": merged, "session_complete": session_complete,
-"updated_at": datetime.utcnow().isoformat()
-}
-if session_complete:
-update_payload["completed_at"] = datetime.utcnow().isoformat()
+        update_payload = {
+            "messages": messages, "phase": next_phase,
+            "extracted": merged, "session_complete": session_complete,
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        if session_complete:
+            update_payload["completed_at"] = datetime.utcnow().isoformat()
 
-db.collection("users").document(user_id) \
-.collection("therapy_sessions").document(session_id).update(update_payload)
+        db.collection("users").document(user_id) \
+          .collection("therapy_sessions").document(session_id).update(update_payload)
 
-return jsonify({
-"session_id": session_id, "reply": ai_reply,
-"phase": next_phase, "session_complete": session_complete,
-"extracted": merged,
-"turn_count": len([m for m in messages if m["role"] == "user"])
-})
+        return jsonify({
+            "session_id": session_id, "reply": ai_reply,
+            "phase": next_phase, "session_complete": session_complete,
+            "extracted": merged,
+            "turn_count": len([m for m in messages if m["role"] == "user"])
+        })
 
-except Exception as e:
-import traceback; print(traceback.format_exc())
-return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        import traceback; print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
 
 
 # ════════════════════════════════════════════════════════════
@@ -572,66 +567,66 @@ return jsonify({"error": str(e)}), 500
 # ════════════════════════════════════════════════════════════
 @app.route('/session-to-plan', methods=['POST', 'OPTIONS'])
 def session_to_plan():
-if request.method == 'OPTIONS':
-return '', 204
-try:
-data = request.get_json()
-user_id = data.get("user_id")
-session_id = data.get("session_id")
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        data = request.get_json()
+        user_id = data.get("user_id")
+        session_id = data.get("session_id")
 
-if not user_id or not session_id:
-return jsonify({"error": "user_id and session_id required"}), 400
+        if not user_id or not session_id:
+            return jsonify({"error": "user_id and session_id required"}), 400
 
-doc = db.collection("users").document(user_id) \
-.collection("therapy_sessions").document(session_id).get()
-if not doc.exists:
-return jsonify({"error": "Session not found"}), 404
+        doc = db.collection("users").document(user_id) \
+                .collection("therapy_sessions").document(session_id).get()
+        if not doc.exists:
+            return jsonify({"error": "Session not found"}), 404
 
-session_data = doc.to_dict()
-if not session_data.get("session_complete"):
-return jsonify({"error": "Session not complete.", "current_phase": session_data.get("phase", 1)}), 400
+        session_data = doc.to_dict()
+        if not session_data.get("session_complete"):
+            return jsonify({"error": "Session not complete.", "current_phase": session_data.get("phase", 1)}), 400
 
-extracted = session_data.get("extracted", {})
-if not extracted.get("proposed_task", {}).get("name"):
-return jsonify({"error": "No task extracted"}), 400
+        extracted = session_data.get("extracted", {})
+        if not extracted.get("proposed_task", {}).get("name"):
+            return jsonify({"error": "No task extracted"}), 400
 
-session_summary = (
-f"SITUATION: {extracted.get('situation', '')}\n"
-f"ANXIOUS THOUGHT: {extracted.get('anxious_thought', '')}\n"
-f"EMOTION: {extracted.get('emotion', '')}\n"
-f"CBT REFRAME: {extracted.get('reframe', '')}\n"
-f"PROPOSED TASK: {json.dumps(extracted.get('proposed_task', {}))}"
-)
+        session_summary = (
+            f"SITUATION: {extracted.get('situation', '')}\n"
+            f"ANXIOUS THOUGHT: {extracted.get('anxious_thought', '')}\n"
+            f"EMOTION: {extracted.get('emotion', '')}\n"
+            f"CBT REFRAME: {extracted.get('reframe', '')}\n"
+            f"PROPOSED TASK: {json.dumps(extracted.get('proposed_task', {}))}"
+        )
 
-response = client.chat.completions.create(
-model="llama-3.3-70b-versatile",
-messages=[{"role": "user", "content": SESSION_TO_PLAN_PROMPT.format(session_summary=session_summary)}],
-temperature=0.3, max_tokens=500
-)
-plan = parse_json_response(response.choices[0].message.content.strip())
-if not plan:
-return jsonify({"error": "Failed to parse plan"}), 500
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": SESSION_TO_PLAN_PROMPT.format(session_summary=session_summary)}],
+            temperature=0.3, max_tokens=500
+        )
+        plan = parse_json_response(response.choices[0].message.content.strip())
+        if not plan:
+            return jsonify({"error": "Failed to parse plan"}), 500
 
-plan["session_id"] = session_id
-plan["created_at"] = int(datetime.now().timestamp() * 1000)
-plan["completed"] = False
-plan["source"] = "therapy_session"
-if not plan.get("scheduledDate"):
-plan["scheduledDate"] = int((datetime.now().timestamp() + 86400) * 1000)
+        plan["session_id"] = session_id
+        plan["created_at"] = int(datetime.now().timestamp() * 1000)
+        plan["completed"] = False
+        plan["source"] = "therapy_session"
+        if not plan.get("scheduledDate"):
+            plan["scheduledDate"] = int((datetime.now().timestamp() + 86400) * 1000)
 
-ref = db.collection("users").document(user_id).collection("activities").document()
-ref.set(plan)
-plan["id"] = ref.id
+        ref = db.collection("users").document(user_id).collection("activities").document()
+        ref.set(plan)
+        plan["id"] = ref.id
 
-db.collection("users").document(user_id) \
-.collection("therapy_sessions").document(session_id) \
-.update({"plan_id": ref.id, "plan_created_at": datetime.utcnow().isoformat()})
+        db.collection("users").document(user_id) \
+          .collection("therapy_sessions").document(session_id) \
+          .update({"plan_id": ref.id, "plan_created_at": datetime.utcnow().isoformat()})
 
-return jsonify({"success": True, "plan": plan, "activity_id": ref.id})
+        return jsonify({"success": True, "plan": plan, "activity_id": ref.id})
 
-except Exception as e:
-import traceback; print(traceback.format_exc())
-return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        import traceback; print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
 
 
 # ════════════════════════════════════════════════════════════
@@ -640,38 +635,38 @@ return jsonify({"error": str(e)}), 500
 @app.route('/therapy-session/history', methods=['POST', 'OPTIONS'])
 @app.route('/api/therapy-session-history', methods=['POST', 'OPTIONS'])
 def therapy_session_history():
-if request.method == 'OPTIONS':
-return '', 204
+    if request.method == 'OPTIONS':
+        return '', 204
 
-data = request.get_json()
-user_id = data.get("user_id")
-if not user_id:
-return jsonify({"error": "user_id required"}), 400
+    data = request.get_json()
+    user_id = data.get("user_id")
+    if not user_id:
+        return jsonify({"error": "user_id required"}), 400
 
-try:
-docs = db.collection("users").document(user_id) \
-.collection("therapy_sessions") \
-.order_by("created_at", direction=firestore.Query.DESCENDING) \
-.limit(20).stream()
+    try:
+        docs = db.collection("users").document(user_id) \
+                 .collection("therapy_sessions") \
+                 .order_by("created_at", direction=firestore.Query.DESCENDING) \
+                 .limit(20).stream()
 
-sessions = []
-for doc in docs:
-d = doc.to_dict()
-sessions.append({
-"session_id": doc.id,
-"created_at": d.get("created_at"),
-"session_complete": d.get("session_complete", False),
-"phase": d.get("phase", 1),
-"plan_id": d.get("plan_id"),
-"situation": d.get("extracted", {}).get("situation", ""),
-"task_name": d.get("extracted", {}).get("proposed_task", {}).get("name", ""),
-"turn_count": len([m for m in d.get("messages", []) if m.get("role") == "user"])
-})
+        sessions = []
+        for doc in docs:
+            d = doc.to_dict()
+            sessions.append({
+                "session_id": doc.id,
+                "created_at": d.get("created_at"),
+                "session_complete": d.get("session_complete", False),
+                "phase": d.get("phase", 1),
+                "plan_id": d.get("plan_id"),
+                "situation": d.get("extracted", {}).get("situation", ""),
+                "task_name": d.get("extracted", {}).get("proposed_task", {}).get("name", ""),
+                "turn_count": len([m for m in d.get("messages", []) if m.get("role") == "user"])
+            })
 
-return jsonify({"success": True, "sessions": sessions})
+        return jsonify({"success": True, "sessions": sessions})
 
-except Exception as e:
-return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ════════════════════════════════════════════════════════════
@@ -679,38 +674,38 @@ return jsonify({"error": str(e)}), 500
 # ════════════════════════════════════════════════════════════
 @app.route('/health', methods=['GET'])
 def health():
-return jsonify({
-"status": "ok",
-"tts_provider": "Google Cloud TTS — Chirp HD",
-"tts_voice": GOOGLE_TTS_VOICE,
-"tts_key_set": bool(GOOGLE_TTS_KEY),
-"ssml_enabled": False,
-"features": [
-"sentence-chunked streaming via /speak-stream",
-"thinking fillers — 40% random prepend",
-"emotion-aware pacing",
-"JSON safety net in /speak and /speak-stream",
-"digit-to-word conversion",
-]
-})
+    return jsonify({
+        "status": "ok",
+        "tts_provider": "Google Cloud TTS — Chirp HD",
+        "tts_voice": GOOGLE_TTS_VOICE,
+        "tts_key_set": bool(GOOGLE_TTS_KEY),
+        "ssml_enabled": False,
+        "features": [
+            "sentence-chunked streaming via /speak-stream",
+            "thinking fillers — 40% random prepend",
+            "emotion-aware pacing",
+            "JSON safety net in /speak and /speak-stream",
+            "digit-to-word conversion",
+        ]
+    })
 
 
 @app.route('/')
 def index():
-return jsonify({
-"status": "Voice therapy backend running",
-"tts": "Google Cloud TTS — Chirp HD-O (plain text)",
-"endpoints": {
-"/speak": "single-shot TTS",
-"/speak-stream": "sentence-chunked TTS — faster + more natural",
-"/transcribe": "Whisper STT",
-"/therapy-session": "CBT session turn",
-"/session-to-plan": "convert session to activity plan",
-"/therapy-session/history": "list past sessions",
-}
-})
+    return jsonify({
+        "status": "Voice therapy backend running",
+        "tts": "Google Cloud TTS — Chirp HD-O (plain text)",
+        "endpoints": {
+            "/speak": "single-shot TTS",
+            "/speak-stream": "sentence-chunked TTS — faster + more natural",
+            "/transcribe": "Whisper STT",
+            "/therapy-session": "CBT session turn",
+            "/session-to-plan": "convert session to activity plan",
+            "/therapy-session/history": "list past sessions",
+        }
+    })
 
 
 if __name__ == '__main__':
-port = int(os.environ.get("PORT", 5000))
-app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
