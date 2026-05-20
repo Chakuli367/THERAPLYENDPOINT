@@ -1361,16 +1361,17 @@ def therapy_session():
     if request.method == 'OPTIONS':
         return '', 204
     try:
-        data = request.get_json()
-        user_id = data.get("user_id")
-        user_message = data.get("message", "").strip()
-        session_id = data.get("session_id")
-        start_new = data.get("start_new", False)
+        data            = request.get_json()
+        user_id         = data.get("user_id")
+        user_message    = data.get("message", "").strip()
+        session_id      = data.get("session_id")
+        start_new       = data.get("start_new", False)
         response_length = data.get("response_length", "long")
 
         if not user_id or not user_message:
             return jsonify({"error": "user_id and message required"}), 400
 
+        # ── Load / create session ──────────────────────────────
         if not session_id or start_new:
             session_id = f"therapy_{user_id}_{int(datetime.now().timestamp())}"
             session_data = {
@@ -1402,14 +1403,13 @@ def therapy_session():
         messages = session_data.get("messages", [])
         if len(messages) == 0:
             messages = [{"role": "system", "content": THERAPY_SYSTEM_PROMPT}]
-
         messages.append({"role": "user", "content": user_message})
 
-        current_phase = session_data.get("phase", 1)
+        current_phase    = session_data.get("phase", 1)
         extracted_so_far = session_data.get("extracted", {})
 
         length_guide = {
-            "short": "RESPONSE LENGTH: SHORT — 1 to 2 sentences max. One thought only.",
+            "short":  "RESPONSE LENGTH: SHORT — 1 to 2 sentences max. One thought only.",
             "medium": "RESPONSE LENGTH: MEDIUM — 2 to 3 sentences. One main point plus a follow-up question.",
             "long": (
                 "RESPONSE LENGTH: LONG — 5 to 7 sentences. This is what a real therapist sounds like. "
@@ -1434,30 +1434,46 @@ def therapy_session():
         }
         messages_for_model = [messages[0], phase_reminder] + messages[1:]
 
-        response = client.chat.completions.create(
+        # ════════════════════════════════════════════════════
+        # STEP 1: LLM call  +  STEP 2: TTS prep — run together
+        # Strategy:
+        #   • LLM call is blocking (Groq is fast, ~400-800ms)
+        #   • The moment we have ai_reply we split into sentences
+        #   • Fire ALL sentence TTS calls in parallel via ThreadPoolExecutor
+        #   • Firestore write happens concurrently with TTS
+        #   • Total latency ≈ max(LLM, longest_single_TTS_sentence)
+        #     instead of LLM + sum(all_TTS_sentences)
+        # ════════════════════════════════════════════════════
+
+        # ── LLM ───────────────────────────────────────────────
+        llm_response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=messages_for_model,
             temperature=0.65,
             max_tokens=length_tokens
         )
-        raw_reply = response.choices[0].message.content.strip()
-        parsed = parse_json_response(raw_reply)
+        raw_reply = llm_response.choices[0].message.content.strip()
+        parsed    = parse_json_response(raw_reply)
 
+        # ── Extract fields ─────────────────────────────────────
         if not parsed:
+            # Unparseable — save and return text only, no audio
             messages.append({"role": "assistant", "content": raw_reply})
             db.collection("users").document(user_id) \
               .collection("therapy_sessions").document(session_id) \
               .update({"messages": messages})
             return jsonify({
                 "session_id": session_id, "reply": raw_reply,
-                "phase": current_phase, "session_complete": False
+                "phase": current_phase, "session_complete": False,
+                "audio_b64": None,
             })
 
-        ai_reply = parsed.get("message", raw_reply)
-        next_phase = parsed.get("phase", current_phase)
+        ai_reply        = parsed.get("message", raw_reply)
+        next_phase      = parsed.get("phase", current_phase)
         session_complete = parsed.get("session_complete", False)
-        new_extracted = parsed.get("extracted", {})
+        new_extracted   = parsed.get("extracted", {})
 
+        # Merge extracted data
         merged = session_data.get("extracted", {})
         for key, val in new_extracted.items():
             if isinstance(val, dict):
@@ -1472,28 +1488,92 @@ def therapy_session():
 
         messages.append({"role": "assistant", "content": ai_reply})
 
-        update_payload = {
-            "messages": messages, "phase": next_phase,
-            "extracted": merged, "session_complete": session_complete,
-            "updated_at": datetime.utcnow().isoformat()
-        }
-        if session_complete:
-            update_payload["completed_at"] = datetime.utcnow().isoformat()
-
-        db.collection("users").document(user_id) \
-          .collection("therapy_sessions").document(session_id).update(update_payload)
-
+        # ── Tone detection ─────────────────────────────────────
         tone, pause_ms = detect_reply_tone(ai_reply)
-        print(f"[tone] → {tone} | pause {pause_ms}ms before speaking")
+
+        # ── Prepare TTS text ───────────────────────────────────
+        cfg        = get_tts_config()
+        clean      = clean_text_for_tts(ai_reply)
+        filled     = add_thinking_filler(clean, cfg)
+        final_text = emotion_aware_preprocess(filled, cfg)
+        sentences  = [s for s in split_into_sentences(final_text) if s.strip()]
+        # Guard: never synthesise more than 8 sentences to stay fast
+        sentences  = sentences[:8]
+
+        # ── Fire Firestore write + all TTS calls in parallel ───
+        # This is the key optimisation:
+        #   - Firestore write doesn't block TTS
+        #   - All N sentences hit Google TTS simultaneously
+        #   - Wall time = slowest single sentence (~300-500ms), not N * 300ms
+        audio_b64 = None
+
+        def _firestore_write():
+            update_payload = {
+                "messages": messages, "phase": next_phase,
+                "extracted": merged, "session_complete": session_complete,
+                "updated_at": datetime.utcnow().isoformat()
+            }
+            if session_complete:
+                update_payload["completed_at"] = datetime.utcnow().isoformat()
+            db.collection("users").document(user_id) \
+              .collection("therapy_sessions").document(session_id) \
+              .update(update_payload)
+
+        def _synthesise_all(sentence_list, tts_cfg):
+            """Synthesise all sentences in parallel, return ordered MP3 bytes."""
+            if not GOOGLE_TTS_KEY or not sentence_list:
+                return None
+            chunks_by_idx = {}
+            # +1 worker for safety margin
+            with ThreadPoolExecutor(max_workers=min(len(sentence_list) + 1, 8)) as pool:
+                future_map = {
+                    pool.submit(synthesize_sentence, s, tts_cfg): i
+                    for i, s in enumerate(sentence_list)
+                }
+                for future in as_completed(future_map):
+                    idx    = future_map[future]
+                    result = future.result()
+                    if result:
+                        chunks_by_idx[idx] = result
+
+            ordered = [chunks_by_idx[i] for i in sorted(chunks_by_idx) if i in chunks_by_idx]
+            if not ordered:
+                return None
+            combined = ordered[0] if len(ordered) == 1 else merge_mp3s(ordered)
+            return append_silence(combined)
+
+        # Run Firestore write and TTS concurrently
+        with ThreadPoolExecutor(max_workers=2) as outer_pool:
+            fs_future  = outer_pool.submit(_firestore_write)
+            tts_future = outer_pool.submit(_synthesise_all, sentences, cfg)
+
+            # Wait for both — TTS is almost always slower so Firestore is free
+            try:
+                fs_future.result(timeout=8)
+            except Exception as fe:
+                print(f"[therapy-session] Firestore write failed: {fe}")
+
+            try:
+                audio_bytes = tts_future.result(timeout=15)
+                if audio_bytes:
+                    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+                    print(f"[therapy-session] TTS done — {len(audio_bytes)} bytes, "
+                          f"{len(sentences)} sentences in parallel")
+            except Exception as te:
+                print(f"[therapy-session] TTS failed (non-fatal): {te}")
+                audio_b64 = None
 
         return jsonify({
-            "session_id": session_id, "reply": ai_reply,
-            "phase": next_phase, "session_complete": session_complete,
-            "extracted": merged,
-            "turn_count": len([m for m in messages if m["role"] == "user"]),
-            "tone": tone,
-            "pause_ms": pause_ms,
-            "response_length": response_length,
+            "session_id":       session_id,
+            "reply":            ai_reply,
+            "phase":            next_phase,
+            "session_complete": session_complete,
+            "extracted":        merged,
+            "turn_count":       len([m for m in messages if m["role"] == "user"]),
+            "tone":             tone,
+            "pause_ms":         pause_ms,
+            "response_length":  response_length,
+            "audio_b64":        audio_b64,  # base64 MP3 or null — frontend falls back to /speak
         })
 
     except Exception as e:
