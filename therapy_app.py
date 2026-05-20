@@ -1606,11 +1606,10 @@ def therapy_session():
                 print(f"[therapy-session] Firestore write failed: {fe}")
 
             try:
-                audio_bytes = tts_future.result(timeout=15)
-                if audio_bytes:
-                    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-                    print(f"[therapy-session] TTS done — {len(audio_bytes)} bytes, "
-                          f"{len(sentences)} sentences in parallel")
+                audio_chunks = tts_future.result(timeout=15)
+                if audio_chunks:
+                    audio_b64 = [base64.b64encode(c).decode("utf-8") for c in audio_chunks]
+                    print(f"[therapy-session] TTS done — {len(audio_chunks)} sentences")
             except Exception as te:
                 print(f"[therapy-session] TTS failed (non-fatal): {te}")
                 audio_b64 = None
