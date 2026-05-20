@@ -1575,27 +1575,24 @@ def therapy_session():
               .update(update_payload)
 
         def _synthesise_all(sentence_list, tts_cfg):
-            """Synthesise all sentences in parallel, return ordered MP3 bytes."""
             if not GOOGLE_TTS_KEY or not sentence_list:
                 return None
             chunks_by_idx = {}
-            # +1 worker for safety margin
             with ThreadPoolExecutor(max_workers=min(len(sentence_list) + 1, 8)) as pool:
                 future_map = {
                     pool.submit(synthesize_sentence, s, tts_cfg): i
                     for i, s in enumerate(sentence_list)
                 }
                 for future in as_completed(future_map):
-                    idx    = future_map[future]
+                    idx = future_map[future]
                     result = future.result()
                     if result:
                         chunks_by_idx[idx] = result
-
             ordered = [chunks_by_idx[i] for i in sorted(chunks_by_idx) if i in chunks_by_idx]
             if not ordered:
                 return None
-            combined = ordered[0] if len(ordered) == 1 else merge_mp3s(ordered)
-            return append_silence(combined)
+            # Return list of individual chunks — no merging, no ffmpeg
+            return ordered
 
         # Run Firestore write and TTS concurrently
         with ThreadPoolExecutor(max_workers=2) as outer_pool:
