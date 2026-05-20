@@ -360,6 +360,49 @@ def parse_json_response(text):
         return None
 
 
+
+# ════════════════════════════════════════════════════════════
+# BRAIN: User Memory Layer
+# ════════════════════════════════════════════════════════════
+
+BRAIN_DEFAULTS = {
+    "emotional_baseline": {"avg_anxiety": 5, "trend": "unknown", "anxiety_history": []},
+    "therapy": {"sessions_completed": 0, "recurring_thoughts": [], "strongest_reframe": "", "last_session_id": ""},
+    "tasks": {"completed": 0, "abandoned": 0, "current_streak": 0},
+    "personality": {"avoidance_triggers": [], "best_practice_time": "", "comfort_locations": []},
+    "last_interaction": "",
+    "last_seen": ""
+}
+
+def get_brain(user_id: str) -> dict:
+    try:
+        doc = db.collection("users").document(user_id)\
+                .collection("brain").document("context").get()
+        return doc.to_dict() if doc.exists else BRAIN_DEFAULTS.copy()
+    except Exception as e:
+        print(f"[brain] read failed: {e}")
+        return BRAIN_DEFAULTS.copy()
+
+def update_brain(user_id: str, updates: dict):
+    try:
+        db.collection("users").document(user_id)\
+          .collection("brain").document("context")\
+          .set(updates, merge=True)
+    except Exception as e:
+        print(f"[brain] write failed: {e}")
+
+def build_brain_context(user_id: str) -> str:
+    brain = get_brain(user_id)
+    return f"""
+USER MEMORY (personalise with this — never mention it explicitly):
+- Anxiety trend: {brain['emotional_baseline']['trend']} (avg: {brain['emotional_baseline']['avg_anxiety']}/10)
+- Therapy sessions done: {brain['therapy']['sessions_completed']}
+- Recurring anxious thoughts: {', '.join(brain['therapy']['recurring_thoughts']) or 'none yet'}
+- Strongest reframe found: {brain['therapy']['strongest_reframe'] or 'none yet'}
+- Known avoidance triggers: {', '.join(brain['personality']['avoidance_triggers']) or 'none yet'}
+"""
+
+
 def detect_reply_tone(ai_reply):
     try:
         import nltk
@@ -1449,6 +1492,29 @@ def therapy_session():
             session_data = doc.to_dict()
 
         if session_data.get("session_complete"):
+
+            # ── Update brain ───────────────────────────────────────────
+            brain_updates = {
+                "last_interaction": "therapy-session",
+                "last_seen": datetime.utcnow().isoformat(),
+                "therapy.last_session_id": session_id,
+            }
+            if session_complete:
+                brain = get_brain(user_id)
+                brain_updates["therapy.sessions_completed"] = brain["therapy"]["sessions_completed"] + 1
+
+            if new_extracted.get("anxious_thought"):
+                brain = get_brain(user_id)
+                thoughts = brain["therapy"]["recurring_thoughts"]
+            if new_extracted["anxious_thought"] not in thoughts:
+                thoughts.append(new_extracted["anxious_thought"])
+                brain_updates["therapy.recurring_thoughts"] = thoughts[-5:]
+
+            if new_extracted.get("reframe"):
+                brain_updates["therapy.strongest_reframe"] = new_extracted["reframe"]
+
+            threading.Thread(target=update_brain, args=(user_id, brain_updates), daemon=True).start()
+
             return jsonify({
                 "session_id": session_id, "reply": "This session is complete.",
                 "phase": 5, "session_complete": True,
@@ -1457,7 +1523,16 @@ def therapy_session():
 
         messages = session_data.get("messages", [])
         if len(messages) == 0:
-            messages = [{"role": "system", "content": THERAPY_SYSTEM_PROMPT}]
+            # Load personality file
+            try:
+                with open("prompt_therapy_personality.txt", "r") as f:
+                    personality = f.read()
+            except FileNotFoundError:
+                personality = ""
+
+            brain_context = build_brain_context(user_id)
+            full_system = personality + "\n\n" + THERAPY_SYSTEM_PROMPT + "\n\n" + brain_context
+            messages = [{"role": "system", "content": full_system}]
         messages.append({"role": "user", "content": user_message})
 
         current_phase    = session_data.get("phase", 1)
