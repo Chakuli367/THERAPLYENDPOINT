@@ -807,6 +807,61 @@ def speak():
 
 
 # ════════════════════════════════════════════════════════════
+# ENDPOINT: /speak-sentences
+# Returns JSON array of base64 MP3s, one per sentence.
+# Frontend plays sentence[0] immediately, queues the rest.
+# No merging, no ffmpeg, no silence padding overhead.
+# ════════════════════════════════════════════════════════════
+@app.route('/speak-sentences', methods=['POST', 'OPTIONS'])
+def speak_sentences():
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        data = request.get_json()
+        text = (data.get("text") or "").strip()
+        if not text:
+            return jsonify({"error": "No text provided"}), 400
+        if not GOOGLE_TTS_KEY:
+            return jsonify({"error": "GOOGLE_TTS_KEY not configured"}), 500
+
+        # Clean + prepare text
+        clean      = clean_text_for_tts(text)
+        cfg        = get_tts_config()
+        filled     = add_thinking_filler(clean, cfg)
+        final_text = emotion_aware_preprocess(filled, cfg)
+        sentences  = [s for s in split_into_sentences(final_text) if s.strip()][:8]
+
+        if not sentences:
+            return jsonify({"sentences": []}), 200
+
+        # Synthesise ALL sentences in parallel
+        chunks_by_idx = {}
+        with ThreadPoolExecutor(max_workers=min(len(sentences), 8)) as pool:
+            future_map = {
+                pool.submit(synthesize_sentence, s, cfg): i
+                for i, s in enumerate(sentences)
+            }
+            for future in as_completed(future_map):
+                idx    = future_map[future]
+                result = future.result()
+                if result:
+                    chunks_by_idx[idx] = base64.b64encode(result).decode("utf-8")
+
+        # Return in order — frontend plays [0] immediately, queues rest
+        ordered = [
+            {"index": i, "audio": chunks_by_idx[i]}
+            for i in sorted(chunks_by_idx)
+            if i in chunks_by_idx
+        ]
+
+        print(f"[speak-sentences] {len(ordered)}/{len(sentences)} sentences synthesised in parallel")
+        return jsonify({"sentences": ordered, "count": len(ordered)})
+
+    except Exception as e:
+        import traceback; print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+        
+# ════════════════════════════════════════════════════════════
 # ENDPOINT: /speak-stream
 # ════════════════════════════════════════════════════════════
 @app.route('/speak-stream', methods=['POST', 'OPTIONS'])
