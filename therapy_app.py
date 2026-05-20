@@ -492,34 +492,259 @@ def synthesize_sentence(sentence, cfg=None):
 # ════════════════════════════════════════════════════════════
 # ENDPOINT: /transcribe
 # ════════════════════════════════════════════════════════════
+
+# ── Therapy-domain Whisper prompt ─────────────────────────────
+WHISPER_PROMPT = (
+    "Therapy session transcript. The speaker may be emotional, speak quietly, "
+    "trail off mid-sentence, or pause. Common words: anxiety, anxious, panic, "
+    "overwhelmed, avoidance, trigger, spiral, reframe, CBT, worthless, hopeless, "
+    "ashamed, embarrassed, therapy, therapist, session, commitment, action steps, "
+    "intrusive thoughts, catastrophising, self-worth, coping, grounding."
+)
+
+# ── Confidence threshold — below this we ask user to repeat ──
+WHISPER_MIN_CONFIDENCE = 0.55
+
+
+def preprocess_audio_for_whisper(audio_bytes: bytes, original_mime: str):
+    """
+    Resample to 16 kHz mono WAV (Whisper's native format).
+    Apply: highpass filter (cut mic rumble below 80 Hz),
+           lowpass filter  (cut above 8 kHz — irrelevant for speech),
+           loudnorm        (EBU R128 loudness normalisation — handles quiet speakers),
+           afftdn          (AI-based noise reduction if available).
+    Falls back to raw bytes if ffmpeg unavailable or fails.
+    Returns (processed_bytes, mime_type, was_processed).
+    """
+    if not _HAS_FFMPEG:
+        return audio_bytes, original_mime, False
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            # Write input
+            ext = (
+                ".mp4" if "mp4" in original_mime
+                else ".ogg" if "ogg" in original_mime
+                else ".webm"
+            )
+            in_path  = os.path.join(tmp, f"input{ext}")
+            out_path = os.path.join(tmp, "whisper_ready.wav")
+
+            with open(in_path, "wb") as f:
+                f.write(audio_bytes)
+
+            # Two-pass: first probe duration so we can detect near-silent files
+            probe = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "json", in_path
+                ],
+                capture_output=True, timeout=5
+            )
+            duration_sec = 0.0
+            if probe.returncode == 0:
+                try:
+                    probe_data = json.loads(probe.stdout)
+                    duration_sec = float(probe_data["format"]["duration"])
+                except Exception:
+                    pass
+
+            # Reject blobs shorter than 0.3 s — can't be real speech
+            if 0 < duration_sec < 0.3:
+                print(f"[preprocess] blob too short ({duration_sec:.2f}s) — skip")
+                return audio_bytes, original_mime, False
+
+            # Audio filter chain
+            # afftdn = neural noise reduction (gracefully ignored if unavailable)
+            af_chain = (
+                "highpass=f=80,"
+                "lowpass=f=8000,"
+                "afftdn=nf=-25,"          # denoise — nf = noise floor dBFS
+                "loudnorm=I=-16:LRA=11:TP=-1.5"   # EBU R128
+            )
+
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y",
+                    "-i", in_path,
+                    "-ar", "16000",     # 16 kHz — Whisper native
+                    "-ac", "1",         # mono
+                    "-af", af_chain,
+                    "-c:a", "pcm_s16le",  # uncompressed WAV = fastest decode
+                    out_path
+                ],
+                capture_output=True, timeout=20, check=True
+            )
+
+            with open(out_path, "rb") as f:
+                processed = f.read()
+
+            print(
+                f"[preprocess] {original_mime} {len(audio_bytes)//1024}KB "
+                f"→ WAV 16kHz {len(processed)//1024}KB "
+                f"(dur={duration_sec:.1f}s)"
+            )
+            return processed, "audio/wav", True
+
+    except subprocess.CalledProcessError as e:
+        # afftdn may not exist on some ffmpeg builds — retry without it
+        print(f"[preprocess] filter chain failed ({e}), retrying without afftdn...")
+        try:
+            with tempfile.TemporaryDirectory() as tmp2:
+                ext = (
+                    ".mp4" if "mp4" in original_mime
+                    else ".ogg" if "ogg" in original_mime
+                    else ".webm"
+                )
+                in2  = os.path.join(tmp2, f"input{ext}")
+                out2 = os.path.join(tmp2, "whisper_ready.wav")
+                with open(in2, "wb") as f:
+                    f.write(audio_bytes)
+
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-i", in2,
+                        "-ar", "16000", "-ac", "1",
+                        "-af", "highpass=f=80,lowpass=f=8000,loudnorm=I=-16:LRA=11:TP=-1.5",
+                        "-c:a", "pcm_s16le",
+                        out2
+                    ],
+                    capture_output=True, timeout=20, check=True
+                )
+                with open(out2, "rb") as f:
+                    return f.read(), "audio/wav", True
+        except Exception as e2:
+            print(f"[preprocess] fallback also failed: {e2} — using raw audio")
+            return audio_bytes, original_mime, False
+
+    except Exception as e:
+        print(f"[preprocess] unexpected error: {e} — using raw audio")
+        return audio_bytes, original_mime, False
+
+
+def compute_avg_confidence(verbose_json_response) -> float:
+    """
+    Pull per-segment no_speech_prob out of verbose_json.
+    Returns average speech confidence (1 - no_speech_prob).
+    Falls back to 1.0 if unavailable (don't penalise missing data).
+    """
+    try:
+        segments = verbose_json_response.segments
+        if not segments:
+            return 1.0
+        confidences = [1.0 - seg.no_speech_prob for seg in segments]
+        return sum(confidences) / len(confidences)
+    except Exception:
+        return 1.0
+
+
+# ════════════════════════════════════════════════════════════
+# ENDPOINT: /transcribe  (v2 — top-notch quality)
+# ════════════════════════════════════════════════════════════
 @app.route('/transcribe', methods=['POST', 'OPTIONS'])
 def transcribe():
     if request.method == 'OPTIONS':
         return '', 204
+
     try:
         if 'audio' not in request.files:
             return jsonify({"error": "No audio file provided"}), 400
 
-        audio_bytes = request.files['audio'].read()
-        audio_name = request.files['audio'].filename or 'audio.webm'
+        audio_file = request.files['audio']
+        audio_bytes = audio_file.read()
+        audio_name  = audio_file.filename or 'audio.webm'
 
+        if not audio_bytes:
+            return jsonify({"error": "Empty audio file"}), 400
+
+        # Detect MIME from filename
         if 'mp4' in audio_name:
-            mime = 'audio/mp4'
+            original_mime = 'audio/mp4'
         elif 'ogg' in audio_name:
-            mime = 'audio/ogg'
+            original_mime = 'audio/ogg'
         else:
-            mime = 'audio/webm'
+            original_mime = 'audio/webm'
 
-        transcript = client.audio.transcriptions.create(
-            model="whisper-large-v3-turbo",
-            file=(audio_name, io.BytesIO(audio_bytes), mime),
+        # ── Step 1: preprocess (resample, denoise, normalise) ──
+        processed_bytes, final_mime, was_processed = preprocess_audio_for_whisper(
+            audio_bytes, original_mime
         )
-        return jsonify({"success": True, "transcript": transcript.text.strip()})
+        final_name = "audio.wav" if was_processed else audio_name
+
+        # ── Step 2: Whisper transcription ──────────────────────
+        transcript_response = client.audio.transcriptions.create(
+            model="whisper-large-v3",          # full v3 — better on quiet/emotional speech
+            file=(final_name, io.BytesIO(processed_bytes), final_mime),
+            language="en",                      # skip language detection overhead
+            prompt=WHISPER_PROMPT,              # prime with therapy vocabulary
+            response_format="verbose_json",     # gives us per-segment confidence
+            temperature=0.0,                    # deterministic — no hallucination
+        )
+
+        raw_text = (transcript_response.text or "").strip()
+
+        # ── Step 3: confidence check ───────────────────────────
+        avg_confidence = compute_avg_confidence(transcript_response)
+        print(
+            f"[transcribe] avg_confidence={avg_confidence:.3f} | "
+            f"text='{raw_text[:80]}'"
+        )
+
+        # Near-silent / no-speech blob
+        if not raw_text:
+            return jsonify({
+                "success": False,
+                "transcript": "",
+                "confidence": 0.0,
+                "error_type": "empty",
+                "user_message": "Nothing was captured. Please try again.",
+            }), 200  # 200 so frontend handles gracefully
+
+        if avg_confidence < WHISPER_MIN_CONFIDENCE:
+            print(f"[transcribe] LOW CONFIDENCE ({avg_confidence:.3f}) — rejecting: '{raw_text}'")
+            return jsonify({
+                "success": False,
+                "transcript": raw_text,         # send it anyway so frontend can decide
+                "confidence": avg_confidence,
+                "error_type": "low_confidence",
+                "user_message": "Couldn't hear that clearly — could you say that again?",
+            }), 200
+
+        # ── Step 4: light post-processing ─────────────────────
+        # Whisper sometimes hallucinates filler on silence
+        HALLUCINATION_PATTERNS = [
+            r"^(thank you\.?|thanks\.?|you\.?|\.+|\s*)$",
+            r"^(bye\.?|goodbye\.?|see you\.?)+$",
+            r"^\[.*\]$",                         # [Music] [Applause] etc.
+        ]
+        import re as _re
+        is_hallucination = any(
+            _re.match(p, raw_text.lower().strip())
+            for p in HALLUCINATION_PATTERNS
+        )
+        if is_hallucination:
+            print(f"[transcribe] HALLUCINATION detected: '{raw_text}'")
+            return jsonify({
+                "success": False,
+                "transcript": "",
+                "confidence": avg_confidence,
+                "error_type": "hallucination",
+                "user_message": "Didn't catch that — please try again.",
+            }), 200
+
+        print(f"[transcribe] ✓ '{raw_text}' (confidence={avg_confidence:.3f})")
+
+        return jsonify({
+            "success": True,
+            "transcript": raw_text,
+            "confidence": round(avg_confidence, 3),
+            "was_preprocessed": was_processed,
+        })
 
     except Exception as e:
         import traceback; print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
-
 
 # ════════════════════════════════════════════════════════════
 # ENDPOINT: /speak (single-shot TTS)
