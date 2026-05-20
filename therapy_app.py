@@ -1355,6 +1355,7 @@ ta.addEventListener('keydown', e => {{
 # ════════════════════════════════════════════════════════════
 # ENDPOINT: /therapy-session
 # ════════════════════════════════════════════════════════════
+
 @app.route('/therapy-session', methods=['POST', 'OPTIONS'])
 def therapy_session():
     if request.method == 'OPTIONS':
@@ -1372,16 +1373,16 @@ def therapy_session():
 
         if not session_id or start_new:
             session_id = f"therapy_{user_id}_{int(datetime.now().timestamp())}"
-            session_data = {{
+            session_data = {
                 "session_id": session_id, "user_id": user_id,
                 "messages": [], "phase": 1,
-                "extracted": {{
+                "extracted": {
                     "situation": "", "anxious_thought": "", "emotion": "", "reframe": "",
-                    "proposed_task": {{"name": "", "type": "", "why": "", "anxiety_pre": 5, "action_steps": []}}
-                }},
+                    "proposed_task": {"name": "", "type": "", "why": "", "anxiety_pre": 5, "action_steps": []}
+                },
                 "session_complete": False,
                 "created_at": datetime.utcnow().isoformat()
-            }}
+            }
             db.collection("users").document(user_id) \
               .collection("therapy_sessions").document(session_id).set(session_data)
         else:
@@ -1392,22 +1393,22 @@ def therapy_session():
             session_data = doc.to_dict()
 
         if session_data.get("session_complete"):
-            return jsonify({{
+            return jsonify({
                 "session_id": session_id, "reply": "This session is complete.",
                 "phase": 5, "session_complete": True,
-                "extracted": session_data.get("extracted", {{}})
-            }})
+                "extracted": session_data.get("extracted", {})
+            })
 
         messages = session_data.get("messages", [])
         if len(messages) == 0:
-            messages = [{{"role": "system", "content": THERAPY_SYSTEM_PROMPT}}]
+            messages = [{"role": "system", "content": THERAPY_SYSTEM_PROMPT}]
 
-        messages.append({{"role": "user", "content": user_message}})
+        messages.append({"role": "user", "content": user_message})
 
         current_phase = session_data.get("phase", 1)
-        extracted_so_far = session_data.get("extracted", {{}})
+        extracted_so_far = session_data.get("extracted", {})
 
-        length_guide = {{
+        length_guide = {
             "short": "RESPONSE LENGTH: SHORT — 1 to 2 sentences max. One thought only.",
             "medium": "RESPONSE LENGTH: MEDIUM — 2 to 3 sentences. One main point plus a follow-up question.",
             "long": (
@@ -1417,20 +1418,20 @@ def therapy_session():
                 "Use natural pauses (...) between thoughts. Do NOT rush to the question — earn it by "
                 "showing you've really heard them first. The person should feel truly seen."
             ),
-        }}.get(response_length, "RESPONSE LENGTH: LONG — 5 to 7 sentences.")
+        }.get(response_length, "RESPONSE LENGTH: LONG — 5 to 7 sentences.")
 
-        length_tokens = {{"short": 200, "medium": 400, "long": 1200}}.get(response_length, 1200)
+        length_tokens = {"short": 200, "medium": 400, "long": 1200}.get(response_length, 1200)
 
-        phase_reminder = {{
+        phase_reminder = {
             "role": "system",
             "content": (
-                f"CURRENT PHASE: {{current_phase}}\n"
-                f"EXTRACTED SO FAR: {{json.dumps(extracted_so_far)}}\n"
-                f"{{length_guide}}\n"
+                f"CURRENT PHASE: {current_phase}\n"
+                f"EXTRACTED SO FAR: {json.dumps(extracted_so_far)}\n"
+                f"{length_guide}\n"
                 "Respond with valid JSON only. Write the message for the EAR — warm, unhurried, "
                 "conversational. Use short sentences and natural pauses (...)."
             )
-        }}
+        }
         messages_for_model = [messages[0], phase_reminder] + messages[1:]
 
         response = client.chat.completions.create(
@@ -1443,25 +1444,25 @@ def therapy_session():
         parsed = parse_json_response(raw_reply)
 
         if not parsed:
-            messages.append({{"role": "assistant", "content": raw_reply}})
+            messages.append({"role": "assistant", "content": raw_reply})
             db.collection("users").document(user_id) \
               .collection("therapy_sessions").document(session_id) \
-              .update({{"messages": messages}})
-            return jsonify({{
+              .update({"messages": messages})
+            return jsonify({
                 "session_id": session_id, "reply": raw_reply,
                 "phase": current_phase, "session_complete": False
-            }})
+            })
 
         ai_reply = parsed.get("message", raw_reply)
         next_phase = parsed.get("phase", current_phase)
         session_complete = parsed.get("session_complete", False)
-        new_extracted = parsed.get("extracted", {{}})
+        new_extracted = parsed.get("extracted", {})
 
-        merged = session_data.get("extracted", {{}})
+        merged = session_data.get("extracted", {})
         for key, val in new_extracted.items():
             if isinstance(val, dict):
                 if key not in merged:
-                    merged[key] = {{}}
+                    merged[key] = {}
                 for subkey, subval in val.items():
                     if subval and subval != "" and subval != 0:
                         merged[key][subkey] = subval
@@ -1469,13 +1470,13 @@ def therapy_session():
                 if val and val != "" and val != 0:
                     merged[key] = val
 
-        messages.append({{"role": "assistant", "content": ai_reply}})
+        messages.append({"role": "assistant", "content": ai_reply})
 
-        update_payload = {{
+        update_payload = {
             "messages": messages, "phase": next_phase,
             "extracted": merged, "session_complete": session_complete,
             "updated_at": datetime.utcnow().isoformat()
-        }}
+        }
         if session_complete:
             update_payload["completed_at"] = datetime.utcnow().isoformat()
 
@@ -1483,9 +1484,9 @@ def therapy_session():
           .collection("therapy_sessions").document(session_id).update(update_payload)
 
         tone, pause_ms = detect_reply_tone(ai_reply)
-        print(f"[tone] → {{tone}} | pause {{pause_ms}}ms before speaking")
+        print(f"[tone] → {tone} | pause {pause_ms}ms before speaking")
 
-        return jsonify({{
+        return jsonify({
             "session_id": session_id, "reply": ai_reply,
             "phase": next_phase, "session_complete": session_complete,
             "extracted": merged,
@@ -1493,12 +1494,12 @@ def therapy_session():
             "tone": tone,
             "pause_ms": pause_ms,
             "response_length": response_length,
-        }})
+        })
 
     except Exception as e:
         import traceback; print(traceback.format_exc())
-        return jsonify({{"error": str(e)}}), 500
-
+        return jsonify({"error": str(e)}), 500
+        
 
 # ════════════════════════════════════════════════════════════
 # ENDPOINT: /session-to-plan
