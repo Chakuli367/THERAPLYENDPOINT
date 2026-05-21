@@ -1896,6 +1896,1101 @@ def index():
     })
 
 
+"""
+╔══════════════════════════════════════════════════════════════════════════╗
+║  THERAPLY — BRAIN + EXERCISE ENGINE                                      ║
+║  Drop-in additions to your existing app.py                               ║
+║                                                                          ║
+║  NEW: /brain/:user_id          — read/update persistent user memory      ║
+║  NEW: /exercise/prescribe      — LLM picks & configures an exercise      ║
+║  NEW: /exercise/complete       — submit results, update brain + session   ║
+║  NEW: /exercise/catalog        — list all available exercise types        ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+Paste this file's contents into your app.py (after your existing helpers,
+before if __name__ == '__main__').  All imports it needs are already in
+your existing file.
+"""
+
+import threading
+
+
+# ════════════════════════════════════════════════════════════
+#  BRAIN v2 — Rich Persistent User Memory
+# ════════════════════════════════════════════════════════════
+
+BRAIN_V2_SCHEMA = {
+    # ── Emotional history ────────────────────────────────────
+    "emotional_baseline": {
+        "avg_anxiety":       5.0,       # rolling 10-session mean
+        "trend":             "unknown", # "improving" | "worsening" | "stable"
+        "anxiety_history":   [],        # list of {"date": iso, "score": int, "session_id": str}
+        "peak_anxiety":      0,
+        "lowest_anxiety":    10,
+        "good_days_streak":  0,
+    },
+
+    # ── Cognitive patterns ───────────────────────────────────
+    "cognitive": {
+        "recurring_distortions": [],    # ["catastrophising", "mind-reading", ...]
+        "strongest_reframe":     "",    # best CBT insight produced
+        "reframe_history": [],          # list of {"reframe": str, "situation": str, "date": iso}
+        "avoidance_triggers":    [],    # situations user avoids
+        "core_fears":            [],    # ["rejection", "failure", "abandonment", ...]
+        "thought_themes":        [],    # recurring thought clusters
+    },
+
+    # ── Session stats ────────────────────────────────────────
+    "therapy": {
+        "sessions_completed":    0,
+        "sessions_abandoned":    0,
+        "avg_session_length":    0,     # turns
+        "last_session_id":       "",
+        "last_session_date":     "",
+        "breakthrough_moments":  [],    # list of {"insight": str, "date": iso}
+    },
+
+    # ── Exercise history ─────────────────────────────────────
+    "exercises": {
+        "total_completed":       0,
+        "types_tried":           [],    # ["breathing_4_7_8", "thought_record", ...]
+        "most_effective":        "",    # exercise type with lowest post-anxiety
+        "avg_anxiety_reduction": 0.0,  # mean (pre - post) across all exercises
+        "recent_results": [],           # last 5 exercise outcomes
+    },
+
+    # ── Personality / preferences ────────────────────────────
+    "personality": {
+        "communication_style":   "unknown", # "direct" | "gentle" | "analytical"
+        "prefers_metaphors":     False,
+        "comfort_locations":     [],
+        "best_practice_time":    "",    # "morning" | "evening" | etc.
+        "support_network":       [],    # ["partner", "friend X", ...]
+        "wins":                  [],    # positive events to reference
+    },
+
+    # ── Meta ─────────────────────────────────────────────────
+    "last_interaction":  "never",
+    "last_seen":         "",
+    "profile_version":   2,
+}
+
+
+def get_brain_v2(user_id: str) -> dict:
+    """Fetch brain from Firestore, filling missing keys from schema."""
+    try:
+        doc = (
+            db.collection("users").document(user_id)
+              .collection("brain").document("context").get()
+        )
+        stored = doc.to_dict() if doc.exists else {}
+    except Exception as e:
+        print(f"[brain_v2] read failed: {e}")
+        stored = {}
+
+    # Deep-merge: schema provides defaults, stored values win
+    import copy
+    merged = copy.deepcopy(BRAIN_V2_SCHEMA)
+    _deep_merge(merged, stored)
+    return merged
+
+
+def _deep_merge(base: dict, override: dict):
+    """Recursively apply override into base (in-place)."""
+    for k, v in override.items():
+        if k in base and isinstance(base[k], dict) and isinstance(v, dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
+
+
+def save_brain_v2(user_id: str, brain: dict):
+    try:
+        db.collection("users").document(user_id) \
+          .collection("brain").document("context") \
+          .set(brain, merge=True)
+    except Exception as e:
+        print(f"[brain_v2] write failed: {e}")
+
+
+def build_rich_brain_context(user_id: str) -> str:
+    """
+    Build a focused, actionable LLM system-prompt insert from the brain.
+    Designed to personalise WITHOUT making the AI sound like it's reading
+    from a file — it shapes tone and emphasis rather than reciting facts.
+    """
+    brain = get_brain_v2(user_id)
+    eb    = brain["emotional_baseline"]
+    cog   = brain["cognitive"]
+    th    = brain["therapy"]
+    ex    = brain["exercises"]
+    pers  = brain["personality"]
+
+    sessions     = th["sessions_completed"]
+    trend        = eb["trend"]
+    avg_anxiety  = eb["avg_anxiety"]
+    triggers     = cog["avoidance_triggers"]
+    distortions  = cog["recurring_distortions"]
+    reframe      = cog["strongest_reframe"]
+    core_fears   = cog["core_fears"]
+    wins         = pers.get("wins", [])
+    support      = pers.get("support_network", [])
+    best_ex      = ex["most_effective"]
+    ex_reduction = ex["avg_anxiety_reduction"]
+
+    lines = [
+        "═══ USER MEMORY — shape your response with this, never recite it ═══",
+    ]
+
+    # Emotional context
+    if sessions == 0:
+        lines.append("First session — no history yet. Start fresh, build trust slowly.")
+    else:
+        lines.append(
+            f"Sessions done: {sessions}. "
+            f"Anxiety trend: {trend} (avg {avg_anxiety:.1f}/10). "
+            + (f"Improving — acknowledge progress subtly." if trend == "improving" else
+               f"Worsening — increase warmth and scaffolding." if trend == "worsening" else
+               "Stable — gently probe what's blocking movement.")
+        )
+
+    # Cognitive patterns
+    if distortions:
+        lines.append(
+            f"Recurring thought patterns: {', '.join(distortions[:3])}. "
+            "You've seen these before — name them gently when they appear."
+        )
+    if reframe:
+        lines.append(
+            f"A reframe that landed before: \"{reframe[:120]}\". "
+            "You can build on this if it fits."
+        )
+    if core_fears:
+        lines.append(
+            f"Core fears: {', '.join(core_fears[:3])}. "
+            "Don't name these directly unless the user opens that door."
+        )
+
+    # Practical
+    if triggers:
+        lines.append(f"Known avoidance triggers: {', '.join(triggers[:4])}.")
+    if wins:
+        lines.append(
+            f"Recent wins to reference warmly if relevant: {'; '.join(str(w) for w in wins[:2])}."
+        )
+    if support:
+        lines.append(f"Support network: {', '.join(str(s) for s in support[:3])}.")
+
+    # Exercise history
+    if ex["total_completed"] > 0 and best_ex:
+        lines.append(
+            f"Exercises completed: {ex['total_completed']}. "
+            f"Most effective: {best_ex} (avg anxiety drop: {ex_reduction:.1f} pts). "
+            "Recommend this type first when relevant."
+        )
+    elif ex["total_completed"] > 0:
+        lines.append(f"Exercises completed: {ex['total_completed']}.")
+
+    # Communication style
+    style = pers.get("communication_style", "unknown")
+    if style == "direct":
+        lines.append("Prefers direct language. Skip long preamble — get to the point.")
+    elif style == "analytical":
+        lines.append("Analytical — responds well to structured reframes and named cognitive patterns.")
+    elif style == "gentle":
+        lines.append("Needs gentle pacing — go slowly, validate heavily before challenging.")
+
+    lines.append("═══════════════════════════════════════════════════════════")
+    return "\n".join(lines)
+
+
+def update_brain_after_session(user_id: str, session_data: dict):
+    """
+    Called after a therapy session completes.
+    Updates: anxiety history, distortions, reframe, triggers, streak.
+    Pure function logic — Firestore write happens in a background thread.
+    """
+    brain    = get_brain_v2(user_id)
+    extracted = session_data.get("extracted", {})
+    messages  = session_data.get("messages", [])
+
+    # ── Anxiety score ─────────────────────────────────────────
+    pre_anxiety = (
+        extracted.get("proposed_task", {}).get("anxiety_pre") or
+        session_data.get("anxiety_pre") or 5
+    )
+    history = brain["emotional_baseline"]["anxiety_history"]
+    history.append({
+        "date":       datetime.utcnow().isoformat(),
+        "score":      pre_anxiety,
+        "session_id": session_data.get("session_id", ""),
+    })
+    history = history[-20:]  # keep last 20 sessions
+
+    scores = [h["score"] for h in history]
+    avg = sum(scores) / len(scores)
+    if len(scores) >= 3:
+        recent3 = scores[-3:]
+        if recent3[-1] < recent3[0] - 0.5:
+            trend = "improving"
+        elif recent3[-1] > recent3[0] + 0.5:
+            trend = "worsening"
+        else:
+            trend = "stable"
+    else:
+        trend = "unknown"
+
+    brain["emotional_baseline"]["anxiety_history"] = history
+    brain["emotional_baseline"]["avg_anxiety"]     = round(avg, 2)
+    brain["emotional_baseline"]["trend"]           = trend
+    brain["emotional_baseline"]["peak_anxiety"]    = max(brain["emotional_baseline"]["peak_anxiety"], pre_anxiety)
+    brain["emotional_baseline"]["lowest_anxiety"]  = min(brain["emotional_baseline"]["lowest_anxiety"], pre_anxiety)
+
+    # ── Reframe history ───────────────────────────────────────
+    reframe = extracted.get("reframe", "")
+    if reframe:
+        brain["cognitive"]["strongest_reframe"] = reframe
+        rh = brain["cognitive"]["reframe_history"]
+        rh.append({
+            "reframe":   reframe,
+            "situation": extracted.get("situation", ""),
+            "date":      datetime.utcnow().isoformat(),
+        })
+        brain["cognitive"]["reframe_history"] = rh[-10:]
+
+    # ── Avoidance triggers ────────────────────────────────────
+    situation = extracted.get("situation", "")
+    if situation and situation not in brain["cognitive"]["avoidance_triggers"]:
+        brain["cognitive"]["avoidance_triggers"].append(situation)
+        brain["cognitive"]["avoidance_triggers"] = brain["cognitive"]["avoidance_triggers"][-10:]
+
+    # ── Session stats ─────────────────────────────────────────
+    brain["therapy"]["sessions_completed"] += 1
+    brain["therapy"]["last_session_id"]    = session_data.get("session_id", "")
+    brain["therapy"]["last_session_date"]  = datetime.utcnow().isoformat()
+
+    turn_count = len([m for m in messages if m.get("role") == "user"])
+    prev_avg   = brain["therapy"]["avg_session_length"]
+    n          = brain["therapy"]["sessions_completed"]
+    brain["therapy"]["avg_session_length"] = round(
+        (prev_avg * (n - 1) + turn_count) / n, 1
+    )
+
+    # ── Meta ──────────────────────────────────────────────────
+    brain["last_interaction"] = "therapy-session"
+    brain["last_seen"]        = datetime.utcnow().isoformat()
+
+    threading.Thread(
+        target=save_brain_v2, args=(user_id, brain), daemon=True
+    ).start()
+
+
+def update_brain_after_exercise(user_id: str, result: dict):
+    """
+    Called when an exercise is completed.
+    Updates: exercise history, most_effective, avg_anxiety_reduction.
+    """
+    brain   = get_brain_v2(user_id)
+    ex      = brain["exercises"]
+    ex_type = result.get("exercise_type", "unknown")
+    pre     = float(result.get("anxiety_pre",  5))
+    post    = float(result.get("anxiety_post", 5))
+    reduction = pre - post
+
+    ex["total_completed"] += 1
+
+    if ex_type not in ex["types_tried"]:
+        ex["types_tried"].append(ex_type)
+
+    recent = ex.get("recent_results", [])
+    recent.append({
+        "type":      ex_type,
+        "pre":       pre,
+        "post":      post,
+        "reduction": round(reduction, 1),
+        "date":      datetime.utcnow().isoformat(),
+    })
+    ex["recent_results"] = recent[-5:]
+
+    # Recompute avg reduction
+    all_results = ex["recent_results"]
+    if all_results:
+        ex["avg_anxiety_reduction"] = round(
+            sum(r["reduction"] for r in all_results) / len(all_results), 2
+        )
+
+    # Find most effective type
+    by_type: dict = {}
+    for r in all_results:
+        t = r["type"]
+        by_type.setdefault(t, []).append(r["reduction"])
+    if by_type:
+        ex["most_effective"] = max(by_type, key=lambda t: sum(by_type[t]) / len(by_type[t]))
+
+    brain["exercises"]         = ex
+    brain["last_interaction"]  = "exercise"
+    brain["last_seen"]         = datetime.utcnow().isoformat()
+
+    threading.Thread(
+        target=save_brain_v2, args=(user_id, brain), daemon=True
+    ).start()
+
+
+# ════════════════════════════════════════════════════════════
+#  EXERCISE CATALOG
+# ════════════════════════════════════════════════════════════
+
+EXERCISE_CATALOG = {
+
+    # ── Breathing ────────────────────────────────────────────
+    "breathing_box": {
+        "name":        "Box breathing",
+        "description": "4-4-4-4 rhythmic breathing to calm the nervous system",
+        "best_for":    ["acute anxiety", "panic", "pre-event nerves"],
+        "duration_s":  180,
+        "config": {
+            "phases": [
+                {"label": "Inhale",  "duration": 4, "color": "#7c6af7"},
+                {"label": "Hold",    "duration": 4, "color": "#a78bfa"},
+                {"label": "Exhale",  "duration": 4, "color": "#4ade80"},
+                {"label": "Hold",    "duration": 4, "color": "#86efac"},
+            ],
+            "cycles":  4,
+            "message": "Let your shoulders drop. Each breath is a reset.",
+        },
+        "inputs": ["anxiety_pre", "anxiety_post", "notes"],
+    },
+
+    "breathing_4_7_8": {
+        "name":        "4-7-8 breathing",
+        "description": "Activates the parasympathetic nervous system",
+        "best_for":    ["insomnia", "high anxiety", "anger"],
+        "duration_s":  240,
+        "config": {
+            "phases": [
+                {"label": "Inhale",  "duration": 4,  "color": "#7c6af7"},
+                {"label": "Hold",    "duration": 7,  "color": "#a78bfa"},
+                {"label": "Exhale",  "duration": 8,  "color": "#4ade80"},
+            ],
+            "cycles":  4,
+            "message": "Longer exhales tell your brain it's safe to relax.",
+        },
+        "inputs": ["anxiety_pre", "anxiety_post", "notes"],
+    },
+
+    # ── Grounding ────────────────────────────────────────────
+    "grounding_5_4_3_2_1": {
+        "name":        "5-4-3-2-1 grounding",
+        "description": "Sensory anchoring to interrupt anxiety spirals",
+        "best_for":    ["dissociation", "panic", "intrusive thoughts"],
+        "duration_s":  300,
+        "config": {
+            "steps": [
+                {"count": 5, "sense": "see",   "icon": "👁",  "prompt": "Name 5 things you can see right now"},
+                {"count": 4, "sense": "touch",  "icon": "✋", "prompt": "Name 4 things you can physically feel"},
+                {"count": 3, "sense": "hear",   "icon": "👂", "prompt": "Name 3 things you can hear"},
+                {"count": 2, "sense": "smell",  "icon": "👃", "prompt": "Name 2 things you can smell"},
+                {"count": 1, "sense": "taste",  "icon": "👅", "prompt": "Name 1 thing you can taste"},
+            ],
+            "message": "Each sense brings you back to the present moment.",
+        },
+        "inputs": ["anxiety_pre", "anxiety_post", "responses", "notes"],
+    },
+
+    # ── Cognitive ────────────────────────────────────────────
+    "thought_record": {
+        "name":        "Thought record",
+        "description": "CBT worksheet: identify, challenge, and reframe a thought",
+        "best_for":    ["rumination", "negative self-talk", "cognitive distortions"],
+        "duration_s":  600,
+        "config": {
+            "fields": [
+                {
+                    "id":          "situation",
+                    "label":       "What just happened?",
+                    "placeholder": "Describe the situation in 1–2 sentences",
+                    "type":        "textarea",
+                    "rows":        2,
+                },
+                {
+                    "id":          "hot_thought",
+                    "label":       "What's the hottest thought in your head?",
+                    "placeholder": "The thought that's hitting hardest right now",
+                    "type":        "textarea",
+                    "rows":        2,
+                },
+                {
+                    "id":          "belief_before",
+                    "label":       "How much do you believe that thought? (0–100%)",
+                    "type":        "slider",
+                    "min":         0,
+                    "max":         100,
+                    "step":        5,
+                    "unit":        "%",
+                },
+                {
+                    "id":          "emotion",
+                    "label":       "What emotion does it bring up?",
+                    "placeholder": "e.g. shame, fear, anger, sadness",
+                    "type":        "text",
+                },
+                {
+                    "id":          "emotion_intensity",
+                    "label":       "Intensity of that emotion (0–100)",
+                    "type":        "slider",
+                    "min":         0,
+                    "max":         100,
+                    "step":        5,
+                    "unit":        "%",
+                },
+                {
+                    "id":          "evidence_for",
+                    "label":       "Evidence that supports this thought",
+                    "placeholder": "Be honest — what facts back it up?",
+                    "type":        "textarea",
+                    "rows":        2,
+                },
+                {
+                    "id":          "evidence_against",
+                    "label":       "Evidence that contradicts this thought",
+                    "placeholder": "What facts challenge it?",
+                    "type":        "textarea",
+                    "rows":        2,
+                },
+                {
+                    "id":          "friend_advice",
+                    "label":       "What would you tell a close friend who had this thought?",
+                    "placeholder": "Imagine they came to you with this exact thought...",
+                    "type":        "textarea",
+                    "rows":        2,
+                },
+                {
+                    "id":          "balanced_thought",
+                    "label":       "A more balanced version of the thought",
+                    "placeholder": "Not toxic positivity — just more accurate",
+                    "type":        "textarea",
+                    "rows":        2,
+                },
+                {
+                    "id":          "belief_after",
+                    "label":       "How much do you believe the original thought now? (0–100%)",
+                    "type":        "slider",
+                    "min":         0,
+                    "max":         100,
+                    "step":        5,
+                    "unit":        "%",
+                },
+            ],
+            "message": "Thoughts are hypotheses, not facts. Let's examine the evidence.",
+        },
+        "inputs": ["anxiety_pre", "anxiety_post", "responses"],
+    },
+
+    # ── Body scan ────────────────────────────────────────────
+    "body_scan": {
+        "name":        "Body scan",
+        "description": "Progressive attention through the body to locate and release tension",
+        "best_for":    ["physical tension", "stress", "mind-body disconnect"],
+        "duration_s":  480,
+        "config": {
+            "zones": [
+                {"id": "head",      "label": "Head & face",    "prompt": "Notice any tension in your jaw, forehead, or eyes"},
+                {"id": "neck",      "label": "Neck & shoulders","prompt": "Let your shoulders drop. Any tightness here?"},
+                {"id": "chest",     "label": "Chest",           "prompt": "Notice your breathing. Is it shallow or deep?"},
+                {"id": "abdomen",   "label": "Abdomen",         "prompt": "Any knots or tension in your stomach?"},
+                {"id": "arms",      "label": "Arms & hands",    "prompt": "Are your hands clenched? Let them relax."},
+                {"id": "legs",      "label": "Legs & feet",     "prompt": "Notice any tension. Let your legs feel heavy."},
+            ],
+            "tension_scale": {"min": 0, "max": 10, "label": "Tension level"},
+            "message":       "You can't think your way out of a body response. Start here.",
+        },
+        "inputs": ["anxiety_pre", "anxiety_post", "zone_ratings", "notes"],
+    },
+
+    # ── Behavioural ──────────────────────────────────────────
+    "fear_ladder": {
+        "name":        "Fear ladder",
+        "description": "Build a hierarchy of exposures from least to most feared",
+        "best_for":    ["avoidance", "social anxiety", "phobias"],
+        "duration_s":  900,
+        "config": {
+            "steps":          10,
+            "fields_per_step": [
+                {"id": "situation", "label": "Situation", "type": "text",   "placeholder": "What would you do?"},
+                {"id": "anxiety",   "label": "SUDS",       "type": "slider", "min": 0, "max": 100, "unit": "/100"},
+            ],
+            "message": "We face fears in small steps — not in one leap.",
+        },
+        "inputs": ["responses", "notes"],
+    },
+
+    "values_compass": {
+        "name":        "Values compass",
+        "description": "Identify what matters most and how current behaviour aligns",
+        "best_for":    ["low motivation", "life direction", "depression"],
+        "duration_s":  600,
+        "config": {
+            "domains": [
+                "Family & relationships", "Work & career",
+                "Health & body", "Personal growth",
+                "Leisure & fun", "Spirituality / meaning",
+                "Community & friendships", "Creativity",
+            ],
+            "fields_per_domain": [
+                {"id": "importance",  "label": "How important is this to you?", "type": "slider", "min": 0, "max": 10},
+                {"id": "living_it",   "label": "How much are you living by it?", "type": "slider", "min": 0, "max": 10},
+            ],
+            "message": "The gap between what matters and what we do is where anxiety lives.",
+        },
+        "inputs": ["responses", "notes"],
+    },
+
+    # ── Visualisation ────────────────────────────────────────
+    "safe_place": {
+        "name":        "Safe place visualisation",
+        "description": "Guided imagery to build an internal anchor of calm",
+        "best_for":    ["high distress", "trauma response", "bedtime anxiety"],
+        "duration_s":  360,
+        "config": {
+            "prompts": [
+                "Close your eyes. Picture a place where you feel completely safe — real or imagined.",
+                "What do you see around you? Notice the colours, shapes, and light.",
+                "What can you hear? Wind, water, silence, music — anything.",
+                "What does the air feel like on your skin? Temperature, texture.",
+                "Notice how your body feels in this place. Let it soften.",
+                "Give this place a name you'll remember.",
+            ],
+            "audio_guided": True,
+            "message": "This place belongs to you. You can return here anytime.",
+        },
+        "inputs": ["anxiety_pre", "anxiety_post", "place_name", "description", "notes"],
+    },
+}
+
+
+EXERCISE_PRESCRIBE_PROMPT = """You are a CBT therapist. Based on this therapy session context, 
+prescribe the SINGLE most appropriate exercise from the catalog.
+
+SESSION CONTEXT:
+{context}
+
+AVAILABLE EXERCISE TYPES:
+{catalog_summary}
+
+RULES:
+- Choose ONE exercise type only
+- Consider the user's anxiety level, current phase, and situation
+- If anxiety > 7, prioritise breathing or grounding
+- If in cognitive phase, prioritise thought_record
+- If avoidance is the theme, consider fear_ladder
+- Return VALID JSON only:
+
+{{
+  "exercise_type": "<type_key>",
+  "rationale": "<one sentence why this fits>",
+  "custom_intro": "<2-3 sentences the AI says to introduce the exercise, warm and spoken>",
+  "anxiety_pre_estimate": <estimated anxiety 1-10>
+}}"""
+
+
+# ════════════════════════════════════════════════════════════
+#  ENDPOINT: GET /brain/:user_id
+# ════════════════════════════════════════════════════════════
+
+@app.route('/brain/<user_id>', methods=['GET', 'OPTIONS'])
+def get_brain_endpoint(user_id):
+    if request.method == 'OPTIONS':
+        return '', 204
+    brain = get_brain_v2(user_id)
+    return jsonify({"success": True, "brain": brain})
+
+
+@app.route('/brain/<user_id>', methods=['POST', 'OPTIONS'])
+def update_brain_endpoint(user_id):
+    """
+    Manually update specific brain fields.
+    Body: {"path.to.field": value, ...}
+    E.g. {"personality.communication_style": "direct"}
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+    data  = request.get_json() or {}
+    brain = get_brain_v2(user_id)
+
+    for dotpath, value in data.items():
+        parts = dotpath.split(".")
+        target = brain
+        for part in parts[:-1]:
+            if part not in target:
+                target[part] = {}
+            target = target[part]
+        target[parts[-1]] = value
+
+    save_brain_v2(user_id, brain)
+    return jsonify({"success": True, "brain": brain})
+
+
+# ════════════════════════════════════════════════════════════
+#  ENDPOINT: /exercise/catalog
+# ════════════════════════════════════════════════════════════
+
+@app.route('/exercise/catalog', methods=['GET'])
+def exercise_catalog():
+    summary = {
+        k: {
+            "name":        v["name"],
+            "description": v["description"],
+            "best_for":    v["best_for"],
+            "duration_s":  v["duration_s"],
+        }
+        for k, v in EXERCISE_CATALOG.items()
+    }
+    return jsonify({"success": True, "exercises": summary})
+
+
+# ════════════════════════════════════════════════════════════
+#  ENDPOINT: POST /exercise/prescribe
+# ════════════════════════════════════════════════════════════
+
+@app.route('/exercise/prescribe', methods=['POST', 'OPTIONS'])
+def exercise_prescribe():
+    """
+    Given a user_id + optional session context, pick the right exercise
+    and return full config + intro speech + optional TTS audio.
+
+    Body:
+    {
+      "user_id":    "...",
+      "session_id": "...",        // optional — loads session context
+      "situation":  "...",        // optional manual override
+      "anxiety":    7,            // optional manual anxiety score
+      "exercise_type": "..."      // optional — skip LLM, use this type directly
+    }
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    try:
+        data          = request.get_json()
+        user_id       = data.get("user_id")
+        session_id    = data.get("session_id")
+        manual_type   = data.get("exercise_type")
+        manual_anx    = data.get("anxiety", 5)
+        manual_sit    = data.get("situation", "")
+
+        if not user_id:
+            return jsonify({"error": "user_id required"}), 400
+
+        # ── Load session context if provided ──────────────────
+        session_ctx = ""
+        session_data = {}
+        if session_id:
+            try:
+                doc = db.collection("users").document(user_id) \
+                        .collection("therapy_sessions").document(session_id).get()
+                if doc.exists:
+                    session_data = doc.to_dict()
+                    ext = session_data.get("extracted", {})
+                    session_ctx = (
+                        f"Situation: {ext.get('situation', manual_sit)}\n"
+                        f"Anxious thought: {ext.get('anxious_thought', '')}\n"
+                        f"Emotion: {ext.get('emotion', '')}\n"
+                        f"Phase: {session_data.get('phase', 1)}\n"
+                        f"Anxiety estimate: {ext.get('proposed_task', {}).get('anxiety_pre', manual_anx)}"
+                    )
+            except Exception as e:
+                print(f"[exercise_prescribe] session load failed: {e}")
+
+        if not session_ctx:
+            session_ctx = (
+                f"Situation: {manual_sit}\nAnxiety: {manual_anx}/10\n"
+                "No active session context."
+            )
+
+        # ── Brain context ──────────────────────────────────────
+        brain_ctx = build_rich_brain_context(user_id)
+
+        # ── Determine exercise type ────────────────────────────
+        if manual_type and manual_type in EXERCISE_CATALOG:
+            ex_type   = manual_type
+            rationale = "Manually selected."
+            intro     = f"I'd like us to try a {EXERCISE_CATALOG[ex_type]['name']} exercise."
+            anx_pre   = manual_anx
+        else:
+            # Let LLM decide
+            catalog_summary = "\n".join(
+                f"- {k}: {v['name']} — {v['description']} (best for: {', '.join(v['best_for'])})"
+                for k, v in EXERCISE_CATALOG.items()
+            )
+            prompt = EXERCISE_PRESCRIBE_PROMPT.format(
+                context=f"{session_ctx}\n\n{brain_ctx}",
+                catalog_summary=catalog_summary,
+            )
+            llm_resp = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.4,
+                max_tokens=300,
+            )
+            parsed = parse_json_response(llm_resp.choices[0].message.content.strip())
+            if not parsed or parsed.get("exercise_type") not in EXERCISE_CATALOG:
+                # Fallback
+                ex_type   = "breathing_box"
+                rationale = "Default fallback."
+                intro     = "Let's start with some breathing to calm your nervous system."
+                anx_pre   = manual_anx
+            else:
+                ex_type   = parsed["exercise_type"]
+                rationale = parsed.get("rationale", "")
+                intro     = parsed.get("custom_intro", "")
+                anx_pre   = parsed.get("anxiety_pre_estimate", manual_anx)
+
+        exercise_def = EXERCISE_CATALOG[ex_type]
+
+        # ── Build TTS audio for intro ──────────────────────────
+        audio_b64 = None
+        if GOOGLE_TTS_KEY and intro:
+            try:
+                cfg   = get_tts_config()
+                clean = clean_text_for_tts(intro)
+                audio = synthesize_sentence(clean, cfg)
+                if audio:
+                    audio_b64 = base64.b64encode(audio).decode("utf-8")
+            except Exception as e:
+                print(f"[exercise_prescribe] TTS failed (non-fatal): {e}")
+
+        return jsonify({
+            "success":         True,
+            "exercise_type":   ex_type,
+            "exercise":        exercise_def,
+            "rationale":       rationale,
+            "intro_speech":    intro,
+            "anxiety_pre":     anx_pre,
+            "audio_b64":       audio_b64,
+            "session_id":      session_id,
+            "user_id":         user_id,
+        })
+
+    except Exception as e:
+        import traceback; print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+# ════════════════════════════════════════════════════════════
+#  ENDPOINT: POST /exercise/complete
+# ════════════════════════════════════════════════════════════
+
+@app.route('/exercise/complete', methods=['POST', 'OPTIONS'])
+def exercise_complete():
+    """
+    Submit exercise results. Updates brain + session + optionally
+    continues the therapy session with context from the exercise.
+
+    Body:
+    {
+      "user_id":       "...",
+      "session_id":    "...",       // optional — to continue therapy session
+      "exercise_type": "breathing_box",
+      "anxiety_pre":   7,
+      "anxiety_post":  4,
+      "responses":     {...},       // exercise-specific responses
+      "notes":         "...",       // free-text from user
+      "duration_s":    180,         // how long they actually spent
+      "continue_session": true      // if true, generates a therapist reply
+    }
+    """
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    try:
+        data            = request.get_json()
+        user_id         = data.get("user_id")
+        session_id      = data.get("session_id")
+        ex_type         = data.get("exercise_type", "unknown")
+        anxiety_pre     = float(data.get("anxiety_pre",  5))
+        anxiety_post    = float(data.get("anxiety_post", anxiety_pre))
+        responses       = data.get("responses",  {})
+        notes           = data.get("notes", "")
+        duration_s      = data.get("duration_s", 0)
+        continue_sess   = data.get("continue_session", False)
+
+        if not user_id:
+            return jsonify({"error": "user_id required"}), 400
+
+        reduction = anxiety_pre - anxiety_post
+
+        # ── Save exercise result to Firestore ──────────────────
+        result_doc = {
+            "user_id":       user_id,
+            "session_id":    session_id or "",
+            "exercise_type": ex_type,
+            "exercise_name": EXERCISE_CATALOG.get(ex_type, {}).get("name", ex_type),
+            "anxiety_pre":   anxiety_pre,
+            "anxiety_post":  anxiety_post,
+            "reduction":     round(reduction, 1),
+            "responses":     responses,
+            "notes":         notes,
+            "duration_s":    duration_s,
+            "completed_at":  datetime.utcnow().isoformat(),
+        }
+        ref = db.collection("users").document(user_id) \
+                .collection("exercise_results").document()
+        ref.set(result_doc)
+        result_id = ref.id
+
+        # ── Update brain (background) ─────────────────────────
+        threading.Thread(
+            target=update_brain_after_exercise,
+            args=(user_id, {**result_doc, "exercise_type": ex_type}),
+            daemon=True,
+        ).start()
+
+        # ── Optional: continue therapy session ────────────────
+        therapist_reply = None
+        audio_b64       = None
+
+        if continue_sess and session_id:
+            try:
+                doc = db.collection("users").document(user_id) \
+                        .collection("therapy_sessions").document(session_id).get()
+                if doc.exists:
+                    session_data = doc.to_dict()
+                    messages     = session_data.get("messages", [])
+
+                    exercise_summary = _summarise_exercise_for_llm(ex_type, result_doc)
+                    followup_msg = (
+                        f"[Exercise completed: {EXERCISE_CATALOG.get(ex_type, {}).get('name', ex_type)}]\n"
+                        f"{exercise_summary}"
+                    )
+                    messages.append({"role": "user", "content": followup_msg})
+
+                    follow_prompt = {
+                        "role": "system",
+                        "content": (
+                            "The user just completed an exercise. Respond warmly. "
+                            "Acknowledge their anxiety shift specifically. "
+                            "Gently connect what they noticed to the session's theme. "
+                            "RESPONSE LENGTH: MEDIUM — 3 to 4 sentences. "
+                            "Return valid JSON: {\"message\": \"...\", \"phase\": N, "
+                            "\"session_complete\": false, \"extracted\": {}}"
+                        ),
+                    }
+                    messages_for_model = [messages[0], follow_prompt] + messages[1:]
+
+                    llm_resp = client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=messages_for_model,
+                        temperature=0.65,
+                        max_tokens=500,
+                    )
+                    raw   = llm_resp.choices[0].message.content.strip()
+                    parsed = parse_json_response(raw)
+                    therapist_reply = parsed.get("message", raw) if parsed else raw
+                    messages.append({"role": "assistant", "content": therapist_reply})
+
+                    db.collection("users").document(user_id) \
+                      .collection("therapy_sessions").document(session_id) \
+                      .update({"messages": messages})
+
+                    # TTS
+                    if GOOGLE_TTS_KEY and therapist_reply:
+                        cfg   = get_tts_config()
+                        clean = clean_text_for_tts(therapist_reply)
+                        sents = [s for s in split_into_sentences(clean) if s.strip()][:5]
+                        chunks = []
+                        with ThreadPoolExecutor(max_workers=min(len(sents), 5)) as pool:
+                            futures = {pool.submit(synthesize_sentence, s, cfg): i for i, s in enumerate(sents)}
+                            by_idx  = {}
+                            for fut in as_completed(futures):
+                                idx = futures[fut]
+                                r   = fut.result()
+                                if r:
+                                    by_idx[idx] = r
+                        chunks = [by_idx[i] for i in sorted(by_idx) if i in by_idx]
+                        if chunks:
+                            audio_b64 = [base64.b64encode(c).decode("utf-8") for c in chunks]
+
+            except Exception as e:
+                print(f"[exercise_complete] session follow-up failed (non-fatal): {e}")
+
+        return jsonify({
+            "success":          True,
+            "result_id":        result_id,
+            "exercise_type":    ex_type,
+            "anxiety_pre":      anxiety_pre,
+            "anxiety_post":     anxiety_post,
+            "reduction":        round(reduction, 1),
+            "therapist_reply":  therapist_reply,
+            "audio_b64":        audio_b64,
+        })
+
+    except Exception as e:
+        import traceback; print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+
+def _summarise_exercise_for_llm(ex_type: str, result: dict) -> str:
+    """Convert exercise results into a natural language summary for the LLM."""
+    pre    = result.get("anxiety_pre", 5)
+    post   = result.get("anxiety_post", 5)
+    change = pre - post
+    notes  = result.get("notes", "")
+    resp   = result.get("responses", {})
+
+    direction = (
+        f"anxiety dropped from {pre} to {post} (down {change:.0f} points)" if change > 0 else
+        f"anxiety unchanged at {post}" if change == 0 else
+        f"anxiety increased from {pre} to {post}"
+    )
+
+    parts = [f"The user completed {ex_type}. Their {direction}."]
+
+    if ex_type == "thought_record":
+        hot_thought    = resp.get("hot_thought", "")
+        balanced       = resp.get("balanced_thought", "")
+        belief_before  = resp.get("belief_before", "")
+        belief_after   = resp.get("belief_after", "")
+        if hot_thought:
+            parts.append(f"The hot thought was: \"{hot_thought}\".")
+        if balanced:
+            parts.append(f"They reframed it to: \"{balanced}\".")
+        if belief_before and belief_after:
+            parts.append(f"Belief in original thought: {belief_before}% → {belief_after}%.")
+
+    elif ex_type in ("grounding_5_4_3_2_1",):
+        if resp:
+            samples = list(resp.items())[:3]
+            parts.append(
+                "Grounding responses: " +
+                "; ".join(f"{k}: {v}" for k, v in samples)
+            )
+
+    elif ex_type == "body_scan":
+        zone_ratings = result.get("zone_ratings", {})
+        if zone_ratings:
+            high_tension = [z for z, r in zone_ratings.items() if isinstance(r, (int, float)) and r >= 7]
+            if high_tension:
+                parts.append(f"High tension zones: {', '.join(high_tension)}.")
+
+    elif ex_type == "fear_ladder":
+        if resp:
+            top3 = list(resp.items())[:3]
+            parts.append(
+                "Fear ladder steps: " +
+                "; ".join(f"{v.get('situation','?')} (SUDS {v.get('anxiety','?')})" for _, v in top3 if isinstance(v, dict))
+            )
+
+    elif ex_type == "values_compass":
+        if resp:
+            gaps = {
+                domain: (r.get("importance", 5) - r.get("living_it", 5))
+                for domain, r in resp.items()
+                if isinstance(r, dict)
+            }
+            big_gaps = [d for d, g in sorted(gaps.items(), key=lambda x: -x[1])[:2] if g > 2]
+            if big_gaps:
+                parts.append(f"Biggest values gaps: {', '.join(big_gaps)}.")
+
+    elif ex_type == "safe_place":
+        place_name = result.get("place_name", "")
+        description = result.get("description", "")
+        if place_name:
+            parts.append(f"Their safe place is: \"{place_name}\".")
+        if description:
+            parts.append(f"Description: {description[:100]}.")
+
+    if notes:
+        parts.append(f"User note: \"{notes[:200]}\".")
+
+    return " ".join(parts)
+
+
+# ════════════════════════════════════════════════════════════
+#  ENDPOINT: GET /exercise/history/:user_id
+# ════════════════════════════════════════════════════════════
+
+@app.route('/exercise/history/<user_id>', methods=['GET', 'OPTIONS'])
+def exercise_history(user_id):
+    if request.method == 'OPTIONS':
+        return '', 204
+    try:
+        docs = (
+            db.collection("users").document(user_id)
+              .collection("exercise_results")
+              .order_by("completed_at", direction=firestore.Query.DESCENDING)
+              .limit(30).stream()
+        )
+        results = []
+        for doc in docs:
+            d = doc.to_dict()
+            results.append({
+                "id":            doc.id,
+                "exercise_type": d.get("exercise_type"),
+                "exercise_name": d.get("exercise_name"),
+                "anxiety_pre":   d.get("anxiety_pre"),
+                "anxiety_post":  d.get("anxiety_post"),
+                "reduction":     d.get("reduction"),
+                "completed_at":  d.get("completed_at"),
+                "session_id":    d.get("session_id"),
+            })
+        return jsonify({"success": True, "results": results, "count": len(results)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ════════════════════════════════════════════════════════════
+#  PATCH: /therapy-session — upgrade to use brain v2
+#
+#  Replace build_brain_context(user_id) calls in your existing
+#  /therapy-session endpoint with build_rich_brain_context(user_id).
+#
+#  Also add this to your session_complete block inside /therapy-session:
+#
+#    if session_complete:
+#        threading.Thread(
+#            target=update_brain_after_session,
+#            args=(user_id, session_data_for_brain),
+#            daemon=True
+#        ).start()
+#
+#  Where session_data_for_brain = {
+#    "session_id":   session_id,
+#    "extracted":    merged,          # the merged extracted dict
+#    "messages":     messages,
+#    "anxiety_pre":  merged.get("proposed_task", {}).get("anxiety_pre", 5),
+#  }
+# ════════════════════════════════════════════════════════════
+
+
+# ════════════════════════════════════════════════════════════
+#  FRONTEND CONTRACT  (what the React/RN app receives)
+# ════════════════════════════════════════════════════════════
+#
+#  POST /exercise/prescribe  →  {
+#    exercise_type:  "thought_record",
+#    exercise: {
+#      name: "Thought record",
+#      config: { fields: [...] },        ← render this
+#      inputs: ["anxiety_pre", ...],
+#    },
+#    intro_speech: "Let's try a...",
+#    audio_b64:    "<base64 MP3>",       ← play immediately
+#    anxiety_pre:  6,
+#  }
+#
+#  Frontend renders config.fields dynamically.
+#  On submit → POST /exercise/complete with filled responses.
+#
+#  Exercise UI rendering rules by type:
+#
+#  "breathing_*"           → AnimatedBreathingCircle (expand/hold/contract)
+#  "grounding_5_4_3_2_1"  → StepByStepForm (one sense at a time)
+#  "thought_record"        → FormWizard (config.fields, one per screen)
+#  "body_scan"             → SilhouetteMap (tap body zones, rate tension)
+#  "fear_ladder"           → DraggableList (reorder steps by SUDS)
+#  "values_compass"        → RadarChart (two overlapping fills)
+#  "safe_place"            → GuidedAudioForm (prompts + free text)
+
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
