@@ -1807,6 +1807,15 @@ def parse_json_response(text):
             text = text.split("```")[1].split("```")[0].strip()
         return json.loads(text)
     except Exception:
+        pass
+
+    # Fallback: model may have wrapped the JSON in extra commentary.
+    # Grab the outermost {...} block and try parsing that instead.
+    try:
+        start = text.index("{")
+        end   = text.rindex("}") + 1
+        return json.loads(text[start:end])
+    except Exception:
         return None
 
 
@@ -2103,7 +2112,9 @@ CONTEXT:
         )
         raw    = llm_resp.choices[0].message.content.strip()
         parsed = parse_json_response(raw)
-        review_msg = parsed.get("message", raw) if parsed else raw
+        review_msg = parsed.get("message") if parsed else None
+        if not review_msg:
+            review_msg = "Welcome back. How are things sitting with you today?"
 
         # Store as first message in session
         messages = [{"role": "assistant", "content": review_msg, "part": 2}]
@@ -2178,7 +2189,9 @@ Turn count: {len([m for m in messages if m['role'] == 'user'])}
         )
         raw    = llm_resp.choices[0].message.content.strip()
         parsed = parse_json_response(raw)
-        reply  = parsed.get("message", raw) if parsed else raw
+        reply = parsed.get("message") if parsed else None
+        if not reply:
+            reply = "Tell me a bit more about that."
         part_complete = (parsed or {}).get("part_complete", False)
 
         messages.append({"role": "assistant", "content": reply, "part": 2})
@@ -2392,7 +2405,9 @@ Respond with valid JSON:
         )
         raw    = llm_resp.choices[0].message.content.strip()
         parsed = parse_json_response(raw)
-        debrief_msg = parsed.get("message", raw) if parsed else raw
+        debrief_msg = parsed.get("message") if parsed else None
+        if not debrief_msg:
+            debrief_msg = "Let's look at how that went."
 
         # Store as first Part 5 message
         commit_messages = [{"role": "assistant", "content": debrief_msg, "part": 5}]
@@ -2468,7 +2483,9 @@ Suggested commitment for this session: "{session_def.get('commit_prompt', '') if
         )
         raw    = llm_resp.choices[0].message.content.strip()
         parsed = parse_json_response(raw)
-        reply           = parsed.get("message", raw) if parsed else raw
+        reply = parsed.get("message") if parsed else None
+        if not reply:
+            reply = "What's one small thing you're willing to commit to before next session?"
         part_complete   = (parsed or {}).get("part_complete", False)
         commitment_text = (parsed or {}).get("commitment", "")
 
@@ -2998,16 +3015,17 @@ def therapy_session():
         parsed    = parse_json_response(raw_reply)
 
         if not parsed:
-            messages.append({"role": "assistant", "content": raw_reply})
+            fallback_reply = "Sorry, I lost my train of thought there. Can you say that again?"
+            messages.append({"role": "assistant", "content": fallback_reply})
             db.collection("users").document(user_id) \
               .collection("therapy_sessions").document(session_id) \
               .update({"messages": messages})
             return jsonify({
-                "session_id": session_id, "reply": raw_reply,
+                "session_id": session_id, "reply": fallback_reply,
                 "phase": current_phase, "session_complete": False, "audio_b64": None,
             })
 
-        ai_reply         = parsed.get("message", raw_reply)
+        ai_reply         = parsed.get("message") or "Sorry, can you say that again?"
         next_phase       = parsed.get("phase", current_phase)
         session_complete = parsed.get("session_complete", False)
         new_extracted    = parsed.get("extracted", {})
@@ -3400,7 +3418,9 @@ def exercise_complete():
                     )
                     raw    = llm_resp.choices[0].message.content.strip()
                     parsed = parse_json_response(raw)
-                    therapist_reply = parsed.get("message", raw) if parsed else raw
+                    therapist_reply = parsed.get("message") if parsed else None
+                    if not therapist_reply:
+                        therapist_reply = "Good. Let's keep going."
                     messages.append({"role": "assistant", "content": therapist_reply})
                     db.collection("users").document(user_id) \
                       .collection("therapy_sessions").document(session_id) \
