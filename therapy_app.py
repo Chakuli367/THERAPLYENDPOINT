@@ -124,7 +124,7 @@ def voice_turn():
 
     messages.append({"role": "user", "content": transcript})
 
-    cfg =get_tts_config_cached_cached()
+    cfg = get_tts_config_cached()
 
     # ── Step 3: SSE generator — LLM → sentence TTS → stream ─
     def generate():
@@ -1810,10 +1810,9 @@ def merge_mp3s(chunks):
         return b"".join(chunks)
 
 
-
-    _tts_config_cache: dict = {}
-    _tts_config_cache_time: float = 0.0
-    _TTS_CACHE_TTL = 30.0  # seconds
+_tts_config_cache: dict = {}
+_tts_config_cache_time: float = 0.0
+_TTS_CACHE_TTL = 30.0  # seconds
 
 def get_tts_config():
     try:
@@ -1835,7 +1834,7 @@ def get_tts_config_cached() -> dict:
     now = time.monotonic()
     if _tts_config_cache and (now - _tts_config_cache_time) < _TTS_CACHE_TTL:
         return _tts_config_cache
-    cfg =get_tts_config_cached()   # your existing function, keep it as-is
+    cfg = get_tts_config()   # your existing function, keep it as-is
     _tts_config_cache      = cfg
     _tts_config_cache_time = now
     return cfg
