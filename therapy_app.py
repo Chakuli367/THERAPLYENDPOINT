@@ -17,6 +17,7 @@ from openai import OpenAI
 import firebase_admin
 from firebase_admin import credentials, firestore, initialize_app
 from dotenv import load_dotenv
+from queue import Queue, Empty
 
 load_dotenv()
 
@@ -58,6 +59,191 @@ if not firebase_admin._apps:
 
 db = firestore.client()
 
+# ────────────────────────────────────────────────────────────
+#  POST /voice/turn  — unified voice pipeline with SSE streaming
+#  Flow: audio → Whisper → LLM streams → TTS per sentence → SSE chunks
+# ────────────────────────────────────────────────────────────
+@app.route('/voice/turn', methods=['POST', 'OPTIONS'])
+def voice_turn():
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    audio_file  = request.files.get('audio')
+    user_id     = request.form.get('user_id', '')
+    session_id  = request.form.get('session_id', '')
+    context_json = request.form.get('context', '{}')
+
+    if not audio_file:
+        return jsonify({"error": "audio required"}), 400
+
+    # ── Step 1: Whisper STT ──────────────────────────────────
+    audio_bytes   = audio_file.read()
+    original_mime = 'audio/mp4' if 'mp4' in (audio_file.filename or '') else 'audio/webm'
+    processed, final_mime, _ = preprocess_audio_for_whisper(audio_bytes, original_mime)
+
+    try:
+        transcript_resp = client.audio.transcriptions.create(
+            model="whisper-large-v3",
+            file=("audio.wav", io.BytesIO(processed), final_mime),
+            language="en",
+            prompt=WHISPER_PROMPT,
+            response_format="verbose_json",
+            temperature=0.0,
+        )
+    except Exception as e:
+        return jsonify({"error": f"STT failed: {e}"}), 500
+
+    transcript = (transcript_resp.text or "").strip()
+    confidence = compute_avg_confidence(transcript_resp)
+
+    if not transcript or confidence < WHISPER_MIN_CONFIDENCE:
+        def _err():
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Could not hear that clearly — try again.'})}\n\n"
+        return Response(stream_with_context(_err()), mimetype='text/event-stream')
+
+    if any(re.match(p, transcript.lower().strip()) for p in HALLUCINATION_PATTERNS):
+        def _hal():
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Didnt catch that — please try again.'})}\n\n"
+        return Response(stream_with_context(_hal()), mimetype='text/event-stream')
+
+    # ── Step 2: Build LLM messages ───────────────────────────
+    try:
+        context = json.loads(context_json)
+    except Exception:
+        context = {}
+
+    session_data = None
+    if session_id and user_id:
+        session_data = get_structured_session(user_id, session_id)
+
+    messages = context.get('messages') or (session_data or {}).get('messages') or []
+    if not messages:
+        personality   = load_personality()
+        brain_ctx     = build_rich_brain_context(user_id)
+        messages = [{"role": "system", "content": personality + "\n\n" + THERAPY_SYSTEM_PROMPT + "\n\n" + brain_ctx}]
+
+    messages.append({"role": "user", "content": transcript})
+
+    cfg =get_tts_config_cached_cached()
+
+    # ── Step 3: SSE generator — LLM → sentence TTS → stream ─
+    def generate():
+        # First event: transcript back to frontend immediately
+        yield f"data: {json.dumps({'type': 'transcript', 'text': transcript, 'confidence': round(confidence, 3)})}\n\n"
+
+        tts_queue   = Queue()   # sentences ready for TTS
+        text_buffer = ""
+        full_reply  = ""
+        chunk_index = 0
+
+        # TTS worker runs in background, drains tts_queue and SSE-streams results
+        tts_results  = {}
+        tts_done     = threading.Event()
+        tts_errors   = []
+
+        def tts_worker():
+            nonlocal chunk_index
+            while True:
+                try:
+                    item = tts_queue.get(timeout=10)
+                except Empty:
+                    break
+                if item is None:  # sentinel
+                    break
+                idx, sentence = item
+                audio = synthesize_sentence(sentence, cfg)
+                if audio:
+                    tts_results[idx] = base64.b64encode(audio).decode('utf-8')
+                else:
+                    tts_errors.append(idx)
+                tts_queue.task_done()
+            tts_done.set()
+
+        tts_thread = threading.Thread(target=tts_worker, daemon=True)
+        tts_thread.start()
+
+        sentence_idx = 0
+        sent_up_to   = -1   # last chunk index SSE-streamed
+
+        # Stream LLM output, split on sentence boundaries
+        try:
+            stream = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=messages,
+                temperature=0.65,
+                max_tokens=600,
+                stream=True,
+            )
+            for chunk in stream:
+                delta = chunk.choices[0].delta.content or ""
+                text_buffer += delta
+                full_reply  += delta
+
+                # Flush complete sentences to TTS queue
+                while True:
+                    match = re.search(r'(?<=[.!?])\s+', text_buffer)
+                    if not match:
+                        break
+                    sentence = text_buffer[:match.start() + 1].strip()
+                    text_buffer = text_buffer[match.end():]
+                    if sentence:
+                        clean = clean_sentence_for_tts(sentence)
+                        if sentence_idx == 0:
+                            clean = add_thinking_filler(clean, cfg)
+                        tts_queue.put((sentence_idx, clean))
+                        sentence_idx += 1
+
+                # Stream any TTS chunks that are ready in order
+                while sent_up_to + 1 in tts_results:
+                    sent_up_to += 1
+                    yield f"data: {json.dumps({'type': 'audio_chunk', 'index': sent_up_to, 'b64': tts_results[sent_up_to]})}\n\n"
+
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': f'LLM failed: {e}'})}\n\n"
+            tts_queue.put(None)
+            return
+
+        # Flush any remaining partial sentence
+        if text_buffer.strip():
+            clean = clean_sentence_for_tts(text_buffer.strip())
+            tts_queue.put((sentence_idx, clean))
+            sentence_idx += 1
+
+        tts_queue.put(None)  # signal TTS worker to stop
+
+        # Wait for TTS worker and stream remaining chunks in order
+        tts_done.wait(timeout=20)
+        while sent_up_to + 1 < sentence_idx:
+            sent_up_to += 1
+            if sent_up_to in tts_results:
+                yield f"data: {json.dumps({'type': 'audio_chunk', 'index': sent_up_to, 'b64': tts_results[sent_up_to]})}\n\n"
+
+        # Parse reply for session state
+        parsed_reply = parse_json_response(full_reply)
+        ai_message   = (parsed_reply or {}).get('message') or full_reply.strip()
+
+        # Async: persist to Firestore
+        if session_id and user_id and session_data is not None:
+            msgs_to_save = messages + [{"role": "assistant", "content": ai_message}]
+            threading.Thread(
+                target=lambda: db.collection("users").document(user_id)
+                    .collection("structured_sessions").document(session_id)
+                    .update({"messages": msgs_to_save, "updated_at": datetime.utcnow().isoformat()}),
+                daemon=True
+            ).start()
+
+        yield f"data: {json.dumps({'type': 'turn_complete', 'reply_text': ai_message, 'parsed': parsed_reply or {}})}\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control':   'no-cache',
+            'X-Accel-Buffering': 'no',
+            'Access-Control-Allow-Origin': '*',
+        }
+    )
+    
 
 # ════════════════════════════════════════════════════════════
 #  TTS CONFIG & BOOTSTRAP
@@ -1624,6 +1810,11 @@ def merge_mp3s(chunks):
         return b"".join(chunks)
 
 
+
+    _tts_config_cache: dict = {}
+    _tts_config_cache_time: float = 0.0
+    _TTS_CACHE_TTL = 30.0  # seconds
+
 def get_tts_config():
     try:
         doc  = db.collection("config").document("tts_settings").get()
@@ -1636,6 +1827,17 @@ def get_tts_config():
     cfg["pitch"]              = max(-20.0, min(20.0, float(cfg["pitch"])))
     cfg["volume_gain_db"]     = max(-96.0, min(16.0, float(cfg["volume_gain_db"])))
     cfg["filler_probability"] = max(0.0,  min(1.0,  float(cfg["filler_probability"])))
+    return cfg
+
+def get_tts_config_cached() -> dict:
+    global _tts_config_cache, _tts_config_cache_time
+    import time
+    now = time.monotonic()
+    if _tts_config_cache and (now - _tts_config_cache_time) < _TTS_CACHE_TTL:
+        return _tts_config_cache
+    cfg =get_tts_config_cached()   # your existing function, keep it as-is
+    _tts_config_cache      = cfg
+    _tts_config_cache_time = now
     return cfg
 
 
@@ -1691,9 +1893,19 @@ def _synthesise_all(sentence_list, tts_cfg):
     return [chunks_by_idx[i] for i in sorted(chunks_by_idx) if i in chunks_by_idx] or None
 
 
-def split_into_sentences(text):
-    parts = re.split(r'(?<=[.!?])\s+', text.strip())
-    return [p.strip() for p in parts if p.strip()]
+def split_into_sentences(text: str) -> list[str]:
+    # Protect common abbreviations and ellipses before splitting
+    text = re.sub(r'\.\.\.',  '…', text)          # hide ellipses
+    text = re.sub(r'\b(Dr|Mr|Mrs|Ms|Prof|St|vs)\.',
+                  r'\1<dot>', text)                # protect titles
+    parts = re.split(r'(?<=[.!?])\s+(?=[A-Z])', text)
+    out = []
+    for p in parts:
+        p = p.replace('<dot>', '.').replace('…', '...')
+        p = p.strip()
+        if p:
+            out.append(p)
+    return out
 
 
 def clean_sentence_for_tts(text):
@@ -1788,7 +2000,7 @@ def build_tts_response(text: str) -> list[str] | None:
     """Return list of base64-encoded MP3 chunks, or None."""
     if not GOOGLE_TTS_KEY or not text:
         return None
-    cfg        = get_tts_config()
+    cfg        =get_tts_config_cached()
     clean      = clean_text_for_tts(text)
     filled     = add_thinking_filler(clean, cfg)
     final_text = emotion_aware_preprocess(filled, cfg)
@@ -2645,10 +2857,15 @@ def transcribe():
                             "user_message": "Couldn't hear that clearly — could you say that again?"}), 200
 
         HALLUCINATION_PATTERNS = [
-            r"^(thank you\.?|thanks\.?|you\.?|\.+|\s*)$",
-            r"^(bye\.?|goodbye\.?|see you\.?)+$",
-            r"^\[.*\]$",
-        ]
+    r"^(thank you\.?|thanks\.?|you\.?|\.+|\s*)$",
+    r"^(bye\.?|goodbye\.?|see you\.?)+$",
+    r"^\[.*?\]$",                          # [Music], [Applause], etc.
+    r"^(www\.|http)",                      # URL hallucinations
+    r"^(subscribe|like and subscribe)",    # YouTube hallucinations
+    r"^subtitles?\s+by",                   # subtitle credit hallucinations
+    r"^(\w+[,.]?\s*){1,2}$",              # 1-2 word fragments (too short to be real speech)
+    r"(.)\1{4,}",                          # character repetition: "aaaaa"
+]
         if any(re.match(p, raw_text.lower().strip()) for p in HALLUCINATION_PATTERNS):
             return jsonify({"success": False, "transcript": "", "confidence": avg_confidence,
                             "error_type": "hallucination",
@@ -2677,7 +2894,7 @@ def speak():
             return jsonify({"error": "GOOGLE_TTS_KEY not configured"}), 500
 
         clean = clean_text_for_tts(text)
-        cfg   = get_tts_config()
+        cfg   =get_tts_config_cached()
         final = emotion_aware_preprocess(add_thinking_filler(clean, cfg), cfg)
 
         response = http_requests.post(
@@ -2716,7 +2933,7 @@ def speak_sentences():
         if not GOOGLE_TTS_KEY:
             return jsonify({"error": "GOOGLE_TTS_KEY not configured"}), 500
 
-        cfg        = get_tts_config()
+        cfg        =get_tts_config_cached()
         final_text = emotion_aware_preprocess(
             add_thinking_filler(clean_text_for_tts(text), cfg), cfg
         )
@@ -2763,7 +2980,7 @@ def speak_stream():
         except (json.JSONDecodeError, TypeError):
             pass
 
-        cfg       = get_tts_config()
+        cfg       =get_tts_config_cached()
         final     = emotion_aware_preprocess(add_thinking_filler(clean_sentence_for_tts(text), cfg), cfg)
         sentences = split_into_sentences(final) or [final]
 
@@ -2808,7 +3025,7 @@ def speak_test():
         if not GOOGLE_TTS_KEY:
             return jsonify({"error": "GOOGLE_TTS_KEY not configured"}), 500
 
-        cfg = get_tts_config()
+        cfg =get_tts_config_cached()
         if override_voice:
             cfg["voice"] = override_voice
 
@@ -2842,7 +3059,7 @@ def speak_test():
 # ────────────────────────────────────────────────────────────
 @app.route('/voices', methods=['GET'])
 def list_voices():
-    cfg = get_tts_config()
+    cfg =get_tts_config_cached()
     return jsonify({"current_voice": cfg["voice"], "available_voices": AVAILABLE_VOICES})
 
 
@@ -3045,7 +3262,7 @@ def therapy_session():
         messages.append({"role": "assistant", "content": ai_reply})
         tone, pause_ms = detect_reply_tone(ai_reply)
 
-        cfg        = get_tts_config()
+        cfg        =get_tts_config_cached()
         clean      = clean_text_for_tts(ai_reply)
         filled     = add_thinking_filler(clean, cfg)
         final_text = emotion_aware_preprocess(filled, cfg)
@@ -3317,7 +3534,7 @@ def exercise_prescribe():
         audio_b64 = None
         if GOOGLE_TTS_KEY and intro:
             try:
-                cfg   = get_tts_config()
+                cfg   =get_tts_config_cached()
                 audio = synthesize_sentence(clean_text_for_tts(intro), cfg)
                 if audio:
                     audio_b64 = base64.b64encode(audio).decode("utf-8")
@@ -3478,19 +3695,19 @@ def tts_config():
     if request.method == 'OPTIONS':
         return '', 204
     if request.method == 'GET':
-        return jsonify({"success": True, "config": get_tts_config()})
+        return jsonify({"success": True, "config":get_tts_config_cached()})
     try:
         updates = request.get_json() or {}
         if updates.get("action") == "reset_defaults":
             db.collection("config").document("tts_settings").delete()
             bootstrap_tts_config()
-            return jsonify({"success": True, "action": "reset_defaults", "current_config": get_tts_config()})
+            return jsonify({"success": True, "action": "reset_defaults", "current_config":get_tts_config_cached()})
         allowed  = set(TTS_DEFAULTS.keys())
         filtered = {k: v for k, v in updates.items() if k in allowed}
         if not filtered:
             return jsonify({"error": f"No valid fields. Allowed: {sorted(allowed)}"}), 400
         db.collection("config").document("tts_settings").set(filtered, merge=True)
-        return jsonify({"success": True, "updated": filtered, "current_config": get_tts_config()})
+        return jsonify({"success": True, "updated": filtered, "current_config":get_tts_config_cached()})
     except Exception as e:
         import traceback; print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
@@ -3501,7 +3718,7 @@ def tts_config():
 # ────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
-    cfg = get_tts_config()
+    cfg =get_tts_config_cached()
     return jsonify({
         "status": "ok",
         "tts_provider": "Google Cloud TTS",
